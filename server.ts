@@ -4,7 +4,7 @@ import { x402ResourceServer, HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 
 import { NET, ENABLED, netById, payToFor, rampUrl, FACILITATOR_URL, PORT, PUBLIC_URL, ADMIN_TOKEN, DEFAULT_BOND_USD, POC_MULTIPLIER, ERC8004_REQUIRED, usdPrice, assertConfig, type MonadNet } from "./lib/config";
-import { db, getProgram, listPrograms, findDuplicate, walletByToken, getProgramRow, createBountyProgram, recordProgramFunding, listAllPrograms, setProgramApproval, type ReportRow, type ReportStatus, type FundingRequestRow, type AgentWalletRow, type ApprovalRow, type ProgramRow } from "./lib/db";
+import { db, getProgram, listPrograms, findDuplicate, walletByToken, getProgramRow, createBountyProgram, recordProgramFunding, listAllPrograms, setProgramApproval, setProgramRecipe, type ReportRow, type ReportStatus, type FundingRequestRow, type AgentWalletRow, type ApprovalRow, type ProgramRow } from "./lib/db";
 import { canonicalRules, rulesHash, bountyOnchainParams, validateRules, type BountyRules } from "./lib/rules";
 import { SEVERITIES, IMPACT_BY_ID, IMPACTS, machineCheckable, validatePayouts, PRESET_PAYOUTS, criticalFromTvl, type PayoutTable } from "./lib/severity";
 import { decodePaymentHeader, contentHash } from "./lib/payment";
@@ -279,6 +279,43 @@ app.post("/api/programs", async (c) => {
   }, 201);
 });
 
+// ── company: set / read a bounty's verification recipe ──────────────────────
+// This is how a company points a bounty at a real GitHub target and the impact
+// assertions the company agent checks. Admin/ruler-gated: a recipe can carry
+// private build steps.
+app.get("/api/programs/:slug/recipe", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const p = await getProgramRow(c.req.param("slug"));
+  if (!p) return c.json({ error: "not_found" }, 404);
+  return c.json({
+    slug: p.slug, verificationMode: p.verification_mode,
+    recipe: p.verify_recipe ? JSON.parse(p.verify_recipe) : null,
+  });
+});
+
+app.put("/api/programs/:slug/recipe", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const b = await c.req.json().catch(() => ({}) as any);
+  const mode = b?.verificationMode === "company-attested" ? "company-attested" : "onchain-fork";
+  let recipe: any = null;
+  if (mode === "company-attested") {
+    if (!b?.repo || typeof b.repo !== "string") return c.json({ error: "repo_required" }, 422);
+    recipe = {
+      repo: String(b.repo).trim(),
+      ref: b.ref ? String(b.ref) : undefined,
+      buildCmd: b.buildCmd ? String(b.buildCmd) : undefined,
+      runCmd: b.runCmd ? String(b.runCmd) : undefined,
+      port: b.port != null ? Number(b.port) : undefined,
+      healthPath: b.healthPath ? String(b.healthPath) : undefined,
+      bootSec: b.bootSec != null ? Number(b.bootSec) : undefined,
+      assertions: typeof b.assertions === "object" && b.assertions ? b.assertions : {},
+    };
+  }
+  const ok = await setProgramRecipe(c.req.param("slug"), mode as any, recipe);
+  if (!ok) return c.json({ error: "not_found" }, 404);
+  return c.json({ slug: c.req.param("slug"), verificationMode: mode, recipe });
+});
+
 // ── verification: fork the repo, run the PoC, prove the impact ───────────────
 // The company agent calls this to verify a submission for a company-attested
 // bounty. It clones the program's repo into a throwaway sandbox, runs it,
@@ -363,8 +400,12 @@ app.get("/api/programs/:slug/reports", async (c) => {
     const bondUsd = Number(((r.bond_usd ?? 0) + (r.poc_bond_usd ?? 0)).toFixed(3));
     // Decision trace — the triager pipeline, reconstructed from the record so a
     // human can watch how each submission was handled.
-    const trace: { level: string; text: string }[] = [];
+    const explorer = netById(r.network)?.explorer ?? NET.explorer;
+    const txUrl = (h: string | null) => (h ? `${explorer}/tx/${h}` : undefined);
+    const trace: { level: string; text: string; tx?: string; url?: string }[] = [];
     const push = (level: string, text: string) => trace.push({ level, text });
+    const pushTx = (level: string, text: string, h: string | null) =>
+      trace.push({ level, text, tx: h ?? undefined, url: txUrl(h) });
     push("in", `submission ${r.id.slice(0, 8)} received  ·  ${r.severity}  ·  ${r.network}`);
     push(risk.decision === "deny" ? "deny" : "info",
       `risk-assess ${r.payer.slice(0, 10)}…  track record: ${risk.tier} (valid ${risk.valid}/slop ${risk.slop})  ->  ${risk.decision.toUpperCase()}` +
@@ -372,22 +413,32 @@ app.get("/api/programs/:slug/reports", async (c) => {
     if (risk.decision === "deny") {
       push("deny", "DENIED at intake — bond refused, submission not queued");
     } else {
-      push("ok", `bond settled  $${bondUsd}${r.settle_tx ? "  ·  " + r.settle_tx.slice(0, 12) : ""}`);
+      pushTx("ok", `bond settled  $${bondUsd}`, r.settle_tx);
+      if (r.poc_settle_tx) pushTx("ok", "PoC gate settled", r.poc_settle_tx);
       if (r.status === "awaiting_poc") {
         push("warn", "awaiting PoC gate — not queued for a triager until the second payment settles");
       } else {
         if (r.poc) push("info", `PoC attached — running impact harness against ${target}`);
         if (r.status === "triaging") { push("run", "triager agent evaluating scope + impact…"); push("run", "verdict pending"); }
-        if (r.status === "valid") { push("ok", `impact proven  ->  ${r.severity}`); push("ok", `VERDICT: valid  ·  award $${r.payout_usd ?? 0} + bond refunded (atomic settle)`); }
+        if (r.status === "valid") {
+          push("ok", `impact proven  ->  ${r.severity}`);
+          pushTx("ok", `bond refunded  $${bondUsd}`, r.refund_tx);
+          if (r.payout_usd) pushTx("ok", `award paid  $${r.payout_usd}`, r.payout_tx);
+          push("ok", "VERDICT: valid  ·  settled atomically, no human");
+        }
         if (r.status === "slop") push("deny", "VERDICT: slop  ·  no impact demonstrated  ·  bond slashed to treasury");
-        if (r.status === "duplicate") push("warn", "VERDICT: duplicate  ·  identical content hash  ·  bond refunded");
+        if (r.status === "duplicate") pushTx("warn", "VERDICT: duplicate  ·  identical content hash  ·  bond refunded", r.refund_tx);
         if (r.status === "out_of_scope") push("warn", "VERDICT: out of scope  ·  bond slashed");
       }
     }
+    let poc: any = r.poc;
+    try { poc = JSON.parse(r.poc ?? ""); } catch {}
     return {
       id: r.id, title: r.title, severity: r.severity, status: r.status,
       hunter: r.payer, bondUsd, payoutUsd: r.payout_usd, createdAt: r.created_at, triagedAt: r.triaged_at,
       hasPoc: Boolean(r.poc),
+      // The company owns this bounty, so it sees the full finding to triage.
+      summary: r.summary, asset: r.asset, poc, contentHash: r.content_hash,
       risk: { decision: risk.decision, tier: risk.tier, valid: risk.valid, slop: risk.slop, agentId: risk.agentId },
       trace,
     };

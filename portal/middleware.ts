@@ -9,7 +9,7 @@ import { updateSession } from "@/lib/supabase/middleware";
 //  - /api and /skills are proxied to the backend (own auth) — never gated here.
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  if (pathname.startsWith("/api") || pathname.startsWith("/skills") || pathname === "/llms.txt") {
+  if (pathname.startsWith("/api") || pathname.startsWith("/company-api") || pathname.startsWith("/skills") || pathname === "/llms.txt") {
     return NextResponse.next();
   }
 

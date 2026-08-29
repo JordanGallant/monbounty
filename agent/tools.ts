@@ -15,7 +15,7 @@ import { makePayingClient, readChallenge } from "./x402";
 import { NETWORKS, type NetKey } from "../lib/config";
 import { registerCalldata, agentIdFromReceipt, ERC8004 } from "../lib/erc8004";
 import { createWalletClient, createPublicClient, http, defineChain, parseEther } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 
 export interface ToolContext {
   wallet: AgentWallet;
@@ -42,6 +42,22 @@ async function j(res: Response) {
 }
 
 // ── read-only tools ─────────────────────────────────────────────────────────
+
+/**
+ * Generate a fresh wallet for this session. The agent keeps the returned
+ * privateKey (it signs x402 bonds); the human funds the address with USDC.
+ * No custody service needed — the agent owns its own key, like the local-key
+ * path. There is no withdraw beyond paying bonds.
+ */
+export function create_wallet(_ctx: ToolContext, args?: { network?: string }) {
+  const privateKey = generatePrivateKey();
+  const address = privateKeyToAccount(privateKey).address;
+  return {
+    address, privateKey, network: args?.network ?? "testnet",
+    note: "Fresh wallet created. KEEP privateKey for this session — it authorises your x402 bonds. " +
+      "Ask the human to fund " + address + " with USDC before you submit. You need only USDC.",
+  };
+}
 
 export async function check_wallet(ctx: ToolContext) {
   const status = await ctx.wallet.status();
@@ -136,6 +152,11 @@ export async function get_my_reputation(ctx: ToolContext) {
  */
 export async function register_identity(ctx: ToolContext) {
   const net = NETWORKS[ctx.network];
+  if (ctx.network !== "mainnet") {
+    return { registered: false, skipped: true, network: ctx.network,
+      reason: "ERC-8004 registries are deployed on Monad mainnet only; registration is skipped on testnet. " +
+        "Submissions are not blocked here (identity is enforced on mainnet)." };
+  }
   const address = ctx.wallet.address as `0x${string}`;
   const agentURI = `${ctx.baseUrl}/api/agents/${address}/card`;
   const chain = defineChain({
@@ -279,7 +300,9 @@ export async function submit_finding(ctx: ToolContext, f: Finding) {
   if (!draft.ok) return { paid: false as const, error: "invalid_writeup", problems: draft.problems };
 
   const pc = makePayingClient(ctx.privateKey, { network: ctx.network });
-  const url = `${ctx.baseUrl}/api/v1/reports?program=${encodeURIComponent(f.program)}`;
+  // Quote at our own tier on the probe so the signed amount matches the paid retry
+  // (the server reprices the retry from the payer; without this a discounted hunter mismatches).
+  const url = `${ctx.baseUrl}/api/v1/reports?program=${encodeURIComponent(f.program)}&hunter=${ctx.wallet.address}`;
   const res = await pc.fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -300,7 +323,7 @@ export async function submit_finding(ctx: ToolContext, f: Finding) {
 export async function submit_poc(ctx: ToolContext, args: { id: string; poc: string }) {
   if (!args.poc || args.poc.trim().length < 40) return { paid: false as const, error: "poc_too_short" };
   const pc = makePayingClient(ctx.privateKey, { network: ctx.network });
-  const res = await pc.fetch(`${ctx.baseUrl}/api/v1/reports/${args.id}/poc`, {
+  const res = await pc.fetch(`${ctx.baseUrl}/api/v1/reports/${args.id}/poc?hunter=${ctx.wallet.address}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ poc: args.poc.trim() }),
@@ -313,7 +336,7 @@ export async function submit_poc(ctx: ToolContext, args: { id: string; poc: stri
 }
 
 export const TOOLS = {
-  check_wallet, list_programs, get_scope, get_my_reputation, register_identity, check_report,
+  create_wallet, check_wallet, list_programs, get_scope, get_my_reputation, register_identity, check_report,
   draft_writeup, request_funding, wait_for_funding, submit_finding, submit_poc,
 } as const;
 export type ToolName = keyof typeof TOOLS;

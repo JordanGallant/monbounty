@@ -62,6 +62,11 @@ export default function CompanyPortal() {
   const [bond, setBond] = useState("1");
   const [sla, setSla] = useState("604800");
   const [ruler, setRuler] = useState("");
+  const [vmode, setVmode] = useState<"onchain-fork" | "company-attested">("onchain-fork");
+  const [repo, setRepo] = useState("");
+  const [runCmd, setRunCmd] = useState("bun run demo-target/server.js");
+  const [buildCmd, setBuildCmd] = useState("");
+  const [assertions, setAssertions] = useState<Record<string, string>>({});
   const [created, setCreated] = useState<CreatedBounty | null>(null);
   const [fundAmt, setFundAmt] = useState("");
   const [verify, setVerify] = useState<RulesView | null>(null);
@@ -106,7 +111,13 @@ export default function CompanyPortal() {
         scopeOut: scopeOut.split("\n").map((s) => s.trim()).filter(Boolean),
         acceptedImpacts: [...picked], payouts, bondUsd: Number(bond || 1),
         slaSeconds: Number(sla), ruler: ruler.trim(), createdBy: email ?? "company-portal",
+        verificationMode: vmode,
+        verifyRecipe: vmode === "company-attested"
+          ? { repo: repo.trim(), buildCmd: buildCmd.trim() || undefined, runCmd: runCmd.trim() || undefined,
+              port: 4700, healthPath: "/", assertions }
+          : undefined,
       };
+      if (vmode === "company-attested" && !repo.trim()) { setBusy(false); return toast.error("Company-attested needs a repo URL."); }
       const d = await api<CreatedBounty>("/api/programs", { method: "POST", body: JSON.stringify(body) });
       setCreated(d); setFundAmt(String(d.rewardPoolUsd));
       toast.success("Submitted for review — rules committed on chain. It lists to hunters once monbounty approves it.");
@@ -239,9 +250,53 @@ export default function CompanyPortal() {
           </CardContent>
         </Card>
 
-        {/* Step 4 */}
+        {/* Verification */}
         <Card>
-          <CardHeader><StepHead n={4} title="Create — commit the rules" done={!!created} /></CardHeader>
+          <CardHeader><StepHead n={4} title="How submissions are verified" /></CardHeader>
+          <CardContent className="grid gap-4">
+            <div className="grid gap-1.5">
+              <Label>Verification mode</Label>
+              <Select value={vmode} onValueChange={(v) => setVmode((v as any) ?? "onchain-fork")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="onchain-fork">On-chain fork — PoC runs against a chain fork (smart contracts)</SelectItem>
+                  <SelectItem value="company-attested">Company-attested — fork our repo, run the PoC (web / app)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {vmode === "company-attested" && (
+              <div className="grid gap-4 rounded-lg border border-border p-3">
+                <p className="text-xs text-muted-foreground">
+                  We clone this repo in a sandbox, run it, and replay the hunter’s PoC. Only a signed verdict leaves —
+                  your code never does. Set one <b>assertion</b> (regex) per impact that proves it.
+                </p>
+                <div className="grid gap-1.5"><Label>Repo URL</Label>
+                  <Input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="https://github.com/you/target" /></div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="grid gap-1.5"><Label>Build command (optional)</Label>
+                    <Input value={buildCmd} onChange={(e) => setBuildCmd(e.target.value)} placeholder="bun install" /></div>
+                  <div className="grid gap-1.5"><Label>Run command</Label>
+                    <Input value={runCmd} onChange={(e) => setRunCmd(e.target.value)} placeholder="bun run demo-target/server.js" /></div>
+                </div>
+                {[...picked].length > 0 && (
+                  <div className="grid gap-2">
+                    <Label>Impact assertions (regex that must match the exploit’s effect)</Label>
+                    {[...picked].map((id) => (
+                      <div key={id} className="grid grid-cols-[160px_1fr] items-center gap-2">
+                        <code className="truncate text-xs text-muted-foreground">{id}</code>
+                        <Input value={assertions[id] ?? ""} onChange={(e) => setAssertions((a) => ({ ...a, [id]: e.target.value }))} placeholder="sk_live_.*LEAKED" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Step 5 */}
+        <Card>
+          <CardHeader><StepHead n={5} title="Create — commit the rules" done={!!created} /></CardHeader>
           <CardContent className="grid gap-3">
             <p className="text-xs text-muted-foreground">This hashes your scope + payout table on chain. After this, they can’t move — that’s the point.</p>
             <div><Button onClick={create} disabled={busy || !payMsg.ok}>{busy ? "Creating…" : "Create bounty"}</Button></div>
@@ -259,7 +314,7 @@ export default function CompanyPortal() {
 
         {/* Step 5 */}
         <Card className={created ? "" : "opacity-50"}>
-          <CardHeader><StepHead n={5} title="Fund the pool & verify" done={verify?.pool.solvent} /></CardHeader>
+          <CardHeader><StepHead n={6} title="Fund the pool & verify" done={verify?.pool.solvent} /></CardHeader>
           <CardContent className="grid gap-3">
             <p className="text-xs text-muted-foreground">
               A hunter checks the pool covers a critical award before bonding. Send USDC to the ruler, then mark it funded.

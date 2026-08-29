@@ -63,7 +63,9 @@ export interface SubmissionRow {
   id: string; title: string; severity: Severity; status: string;
   hunter: string; bondUsd: number; payoutUsd: number | null;
   createdAt: string; triagedAt: string | null; hasPoc: boolean;
+  summary?: string; asset?: string | null; contentHash?: string;
+  poc?: { impact?: string; requests?: { method?: string; path: string; headers?: Record<string,string>; body?: string }[] } | string;
   risk: { decision: "allow" | "risk" | "deny"; tier: string; valid: number; slop: number; agentId: string | null };
-  trace: { level: string; text: string }[];
+  trace: { level: string; text: string; tx?: string; url?: string }[];
 }
 export interface ProgramReports { slug: string; total: number; counts: Record<string, number>; reports: SubmissionRow[]; }

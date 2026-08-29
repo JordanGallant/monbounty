@@ -415,3 +415,16 @@ export async function setProgramApproval(slug: string, status: "approved" | "rej
     [status, by, slug]);
   return true;
 }
+
+
+/** Set/replace a bounty's verification mode + recipe (repo/build/run/assertions). */
+export async function setProgramRecipe(
+  slug: string, verificationMode: "onchain-fork" | "company-attested", verifyRecipe: unknown | null,
+): Promise<boolean> {
+  await ready;
+  const row = await getProgramRow(slug);
+  if (!row) return false;
+  await db.run("UPDATE programs SET verification_mode = ?, verify_recipe = ? WHERE slug = ?",
+    [verificationMode, verifyRecipe ? JSON.stringify(verifyRecipe) : null, slug]);
+  return true;
+}

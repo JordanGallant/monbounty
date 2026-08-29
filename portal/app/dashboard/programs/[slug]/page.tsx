@@ -6,7 +6,11 @@ import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
+import { toast } from "sonner";
 import { SEVERITIES, type RulesDetail, type ProgramReports, type Severity } from "@/lib/types";
 
 const sevColor: Record<Severity, string> = {
@@ -85,6 +89,9 @@ export default function CompanyProgram() {
           ))}
         </div>
 
+        {/* Verification target */}
+        <RecipePanel slug={slug} />
+
         {/* SUBMISSIONS — real time */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-3">
@@ -120,6 +127,87 @@ export default function CompanyProgram() {
   );
 }
 
+function RecipePanel({ slug }: { slug: string }) {
+  const [mode, setMode] = useState<"onchain-fork" | "company-attested">("onchain-fork");
+  const [repo, setRepo] = useState("");
+  const [runCmd, setRunCmd] = useState("bun run demo-target/server.js");
+  const [buildCmd, setBuildCmd] = useState("");
+  const [assertJson, setAssertJson] = useState('{"web-idor":"sk_live_.*LEAKED"}');
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    fetch(`/company-api/recipe?slug=${slug}`).then((r) => r.json()).then((d) => {
+      if (d.verificationMode) setMode(d.verificationMode);
+      const rc = d.recipe;
+      if (rc) { setRepo(rc.repo ?? ""); setRunCmd(rc.runCmd ?? "bun run demo-target/server.js"); setBuildCmd(rc.buildCmd ?? "");
+        if (rc.assertions) setAssertJson(JSON.stringify(rc.assertions)); }
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, [slug]);
+
+  async function save() {
+    setSaving(true);
+    let assertions: any = {};
+    try { assertions = JSON.parse(assertJson || "{}"); } catch { setSaving(false); return toast.error("Assertions must be valid JSON."); }
+    const body: any = { slug, verificationMode: mode };
+    if (mode === "company-attested") Object.assign(body, { repo: repo.trim(), runCmd: runCmd.trim(), buildCmd: buildCmd.trim() || undefined, port: 4700, healthPath: "/", assertions });
+    const res = await fetch("/company-api/recipe", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    setSaving(false);
+    if (!res.ok) { const e = await res.json().catch(() => ({})); return toast.error(e.error ?? "save failed"); }
+    toast.success("Verification target saved."); setEditing(false);
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-3">
+        <CardTitle className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Verification target</CardTitle>
+        {!editing && loaded && <button onClick={() => setEditing(true)} className="text-xs text-primary hover:underline">edit</button>}
+      </CardHeader>
+      <CardContent className="grid gap-3 text-sm">
+        {!editing ? (
+          <div className="grid gap-1 text-xs">
+            <div className="flex gap-2"><span className="min-w-24 text-muted-foreground">mode</span><span>{mode}</span></div>
+            {mode === "company-attested" ? (
+              <>
+                <div className="flex gap-2"><span className="min-w-24 text-muted-foreground">repo</span><span className="break-all font-mono text-foreground">{repo || "— not set —"}</span></div>
+                <div className="flex gap-2"><span className="min-w-24 text-muted-foreground">run</span><code className="text-foreground">{runCmd}</code></div>
+                <p className="mt-1 text-muted-foreground">On a submission we clone this repo in a sandbox, run it, replay the PoC, and check the impact assertion. Your code never leaves the sandbox.</p>
+              </>
+            ) : <p className="text-muted-foreground">Smart-contract bounty — PoC executed against a chain fork; no repo needed.</p>}
+          </div>
+        ) : (
+          <div className="grid gap-3">
+            <div className="grid gap-1.5"><Label>Mode</Label>
+              <Select value={mode} onValueChange={(v) => setMode((v as any) ?? "onchain-fork")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="onchain-fork">On-chain fork (smart contracts)</SelectItem>
+                  <SelectItem value="company-attested">Company-attested (fork repo, run PoC)</SelectItem>
+                </SelectContent>
+              </Select></div>
+            {mode === "company-attested" && (
+              <>
+                <div className="grid gap-1.5"><Label>Repo URL</Label><Input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="https://github.com/you/target" /></div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-1.5"><Label>Build cmd (optional)</Label><Input value={buildCmd} onChange={(e) => setBuildCmd(e.target.value)} placeholder="bun install" /></div>
+                  <div className="grid gap-1.5"><Label>Run cmd</Label><Input value={runCmd} onChange={(e) => setRunCmd(e.target.value)} /></div>
+                </div>
+                <div className="grid gap-1.5"><Label>Impact assertions (JSON: impactId → regex)</Label><Input className="font-mono text-xs" value={assertJson} onChange={(e) => setAssertJson(e.target.value)} /></div>
+              </>
+            )}
+            <div className="flex gap-2">
+              <Button size="sm" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save"}</Button>
+              <Button size="sm" variant="outline" onClick={() => setEditing(false)}>Cancel</Button>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function FragmentRow({ s, isOpen, onToggle }: { s: import("@/lib/types").SubmissionRow; isOpen: boolean; onToggle: () => void }) {
   return (
     <>
@@ -136,10 +224,62 @@ function FragmentRow({ s, isOpen, onToggle }: { s: import("@/lib/types").Submiss
       </tr>
       {isOpen && (
         <tr className="border-0"><td colSpan={6} className="pb-3">
-          <Terminal id={s.id} lines={s.trace} />
+          <div className="grid gap-3">
+            <FindingDoc s={s} />
+            <Terminal id={s.id} lines={s.trace} />
+          </div>
         </td></tr>
       )}
     </>
+  );
+}
+
+function FindingDoc({ s }: { s: import("@/lib/types").SubmissionRow }) {
+  const poc = typeof s.poc === "object" ? s.poc : null;
+  const reqs = poc?.requests ?? [];
+  const riskColor = s.risk.decision === "deny" ? "text-rose-400" : s.risk.decision === "risk" ? "text-amber-400" : "text-emerald-400";
+  return (
+    <div className="rounded-lg border border-border bg-card/40 p-4 text-sm">
+      {/* README-style finding doc */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-border pb-2">
+        <span className="text-base font-semibold">{s.title}</span>
+        <span className="rounded-full border border-primary/40 px-2 py-0.5 text-[10px] uppercase text-primary">{s.severity}</span>
+        {poc?.impact && <code className="rounded bg-muted px-1.5 py-0.5 text-[11px]">{poc.impact}</code>}
+      </div>
+
+      <div className="mt-3 grid gap-3">
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Submitted by (attacker)</div>
+          <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
+            <span className="text-foreground">{s.hunter}</span>
+            <span className={`rounded-full bg-muted px-2 py-0.5 text-[10px] ${riskColor}`}>{s.risk.tier} · {s.risk.decision}</span>
+            {s.risk.agentId && <span className="text-primary">ERC-8004 #{s.risk.agentId}</span>}
+          </div>
+        </div>
+
+        {s.summary && (
+          <div>
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Summary</div>
+            <p className="leading-relaxed text-muted-foreground">{s.summary}</p>
+          </div>
+        )}
+
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Proof of concept{s.asset ? ` · ${s.asset}` : ""}</div>
+          {reqs.length > 0 ? (
+            <pre className="overflow-x-auto rounded-lg border border-border bg-black/40 p-3 text-xs leading-relaxed">
+              <code>{reqs.map((r, i) => `${i + 1}. ${r.method ?? "GET"} ${r.path}${r.body ? "\n   body: " + r.body : ""}`).join("\n")}</code>
+            </pre>
+          ) : (
+            <pre className="overflow-x-auto rounded-lg border border-border bg-black/40 p-3 text-xs"><code>{typeof s.poc === "string" ? s.poc : "—"}</code></pre>
+          )}
+        </div>
+
+        {s.contentHash && (
+          <div className="font-mono text-[11px] text-muted-foreground">content hash: {s.contentHash.slice(0, 22)}…</div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -147,7 +287,7 @@ const lvlColor: Record<string, string> = {
   in: "text-sky-400", info: "text-zinc-300", ok: "text-emerald-400",
   warn: "text-amber-400", deny: "text-rose-400", run: "text-violet-400",
 };
-function Terminal({ id, lines }: { id: string; lines: { level: string; text: string }[] }) {
+function Terminal({ id, lines }: { id: string; lines: { level: string; text: string; tx?: string; url?: string }[] }) {
   const [shown, setShown] = useState(0);
   useEffect(() => {
     setShown(0);
@@ -163,10 +303,16 @@ function Terminal({ id, lines }: { id: string; lines: { level: string; text: str
       </div>
       <div className="px-3 py-2.5">
         {lines.slice(0, shown).map((l, i) => (
-          <div key={i} className="flex gap-2">
+          <div key={i} className="flex flex-wrap gap-2">
             <span className="select-none text-zinc-600">{String(i + 1).padStart(2, "0")}</span>
             <span className="select-none text-zinc-600">$</span>
             <span className={lvlColor[l.level] ?? "text-zinc-300"}>{l.text}</span>
+            {l.url && (
+              <a href={l.url} target="_blank" rel="noreferrer"
+                 className="text-sky-400 underline decoration-dotted underline-offset-2 hover:text-sky-300">
+                {l.tx ? `${l.tx.slice(0, 10)}…↗` : "tx ↗"}
+              </a>
+            )}
           </div>
         ))}
         {!done && <div className="flex gap-2"><span className="text-zinc-600">··</span><span className="animate-pulse text-violet-400">▊</span></div>}

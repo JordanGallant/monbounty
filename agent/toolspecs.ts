@@ -14,6 +14,13 @@ export const TOOL_SPECS: Anthropic.Tool[] = [
     input_schema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "create_wallet",
+    description:
+      "Generate a fresh wallet for this session and return its address + privateKey. Do this first if you have " +
+      "no wallet. Keep the privateKey — it signs your x402 bonds. Then ask the human to fund the address with USDC.",
+    input_schema: { type: "object", properties: { network: { type: "string", enum: ["testnet", "mainnet"] } }, additionalProperties: false },
+  },
+  {
     name: "list_programs",
     description: "List the bug bounty programs open for submissions, their scope, and the bond each charges.",
     input_schema: { type: "object", properties: {}, additionalProperties: false },
