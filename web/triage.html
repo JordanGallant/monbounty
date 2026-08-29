@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bounty402 — triage</title>
+<style>
+:root{--bg:#0b0910;--panel:#141020;--line:#241c38;--ink:#ece9f5;--dim:#9a92b5;--acc:#836ef9;--ok:#3ecf8e;--bad:#f6685e;--warn:#e8b339}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--acc)}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 20px 72px}
+h1{font-size:24px;margin:0 0 4px}
+.dim{color:var(--dim)}
+.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:18px 0 24px}
+input,select,textarea,button{font:inherit;background:#0a0812;color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:9px 11px}
+input{min-width:320px}
+button{cursor:pointer;background:var(--acc);border-color:var(--acc);color:#0b0910;font-weight:600}
+button.ghost{background:transparent;color:var(--ink);font-weight:500}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
+.head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap}
+h3{margin:0;font-size:16px}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--dim);word-break:break-all}
+pre{background:#0a0812;border:1px solid var(--line);border-radius:9px;padding:12px;overflow-x:auto;font-size:12.5px;white-space:pre-wrap;margin:12px 0 0}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.s-valid{color:var(--ok)} .s-slop{color:var(--bad)} .s-duplicate{color:var(--warn)}
+.s-out_of_scope{color:var(--warn)} .s-triaging{color:var(--acc)} .s-awaiting_poc{color:var(--dim)}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;border-top:1px solid var(--line);padding-top:14px}
+.meta{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--dim);margin-top:10px}
+.meta b{color:var(--ink)}
+.empty{color:var(--dim);text-align:center;padding:40px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Triage</h1>
+  <div class="dim">Every report below has a paid bond behind it. <a href="/">Back to dashboard</a></div>
+
+  <div class="bar">
+    <input id="tok" type="password" placeholder="ADMIN_TOKEN">
+    <select id="filter">
+      <option value="">all</option>
+      <option value="triaging" selected>triaging</option>
+      <option value="awaiting_poc">awaiting PoC</option>
+      <option value="valid">valid</option>
+      <option value="slop">slop</option>
+      <option value="duplicate">duplicate</option>
+    </select>
+    <button id="go">Load</button>
+  </div>
+
+  <div id="approvals"></div>
+  <div id="list"></div>
+</div>
+
+<script>
+const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = n => "$" + Number(n||0).toFixed(2);
+const tok = () => document.getElementById("tok").value.trim();
+
+document.getElementById("tok").value = localStorage.getItem("b402tok") || "";
+
+/**
+ * The overseer queue. Agent 2 rules and pays on its own, but a payout is a push
+ * transaction it signs itself — irreversible — so it blocks here until a human
+ * decides. Everything before this point already happened, unattended.
+ */
+async function loadApprovals(){
+  const box = document.getElementById("approvals");
+  const res = await fetch("/api/admin/approvals?state=pending", { headers: { Authorization: "Bearer " + tok() } });
+  if (!res.ok) { box.innerHTML = ""; return; }
+  const { approvals } = await res.json();
+  if (!approvals.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `
+    <div class="card" style="border-color:var(--warn);margin-bottom:18px">
+      <h3 style="margin:0 0 4px;color:var(--warn)">${approvals.length} payment${approvals.length>1?"s":""} waiting on you</h3>
+      <p class="dim" style="margin:0 0 12px;font-size:13px">An agent has ruled and wants to move real USDC. Nothing is sent until you approve.</p>
+      ${approvals.map(a=>`
+        <div style="border-top:1px solid var(--line);padding:12px 0">
+          <div><b>${esc(a.kind)}</b> · <b>${fmt(a.amount_usd)}</b> to <span class="mono">${esc(a.recipient||"")}</span></div>
+          <div style="margin:4px 0;font-size:14px">${esc(a.title||"")} <span class="dim">(${esc(a.severity||"")})</span></div>
+          ${a.rationale?`<div class="dim" style="font-size:13px">${esc(a.rationale)}</div>`:""}
+          <div style="margin-top:10px;display:flex;gap:8px">
+            <button onclick="decide('${a.id}','approve')">Approve &amp; pay</button>
+            <button onclick="decide('${a.id}','reject')">Reject</button>
+          </div>
+        </div>`).join("")}
+    </div>`;
+}
+
+async function decide(id, action){
+  const note = prompt(`Note for "${action}" (optional):`) ?? "";
+  const res = await fetch(`/api/admin/approvals/${id}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok() },
+    body: JSON.stringify({ by: "overseer", note }),
+  });
+  const out = await res.json();
+  if (!res.ok) { alert("Error: " + JSON.stringify(out)); return; }
+  loadApprovals();
+}
+
+async function load(){
+  localStorage.setItem("b402tok", tok());
+  loadApprovals();
+  const f = document.getElementById("filter").value;
+  const res = await fetch("/api/admin/reports" + (f ? "?status="+f : ""), {
+    headers: { Authorization: "Bearer " + tok() },
+  });
+  const list = document.getElementById("list");
+  if (!res.ok) { list.innerHTML = `<div class="empty">${res.status === 401 ? "Bad or missing ADMIN_TOKEN." : "Error "+res.status}</div>`; return; }
+  const { reports } = await res.json();
+  if (!reports.length) { list.innerHTML = `<div class="empty">Nothing here.</div>`; return; }
+
+  list.innerHTML = reports.map(r => `
+    <div class="card">
+      <div class="head">
+        <div>
+          <h3>${esc(r.title)}</h3>
+          <div class="mono">${esc(r.id)}</div>
+        </div>
+        <span class="pill s-${esc(r.status)}">${esc(r.status.replace(/_/g," "))}</span>
+      </div>
+      <div class="meta">
+        <span>Program <b>${esc(r.program)}</b></span>
+        <span>Severity <b>${esc(r.severity)}</b></span>
+        <span>Asset <b>${esc(r.asset || "—")}</b></span>
+        <span>Bonded <b>${fmt((r.bond_usd||0)+(r.poc_bond_usd||0))}</b></span>
+      </div>
+      <div class="mono" style="margin-top:8px">payer ${esc(r.payer)}</div>
+      <div class="mono">hash ${esc(r.content_hash)}</div>
+      ${r.settle_tx ? `<div class="mono">bond tx ${esc(r.settle_tx)}</div>` : ""}
+      ${r.poc_settle_tx ? `<div class="mono">poc tx ${esc(r.poc_settle_tx)}</div>` : ""}
+      <pre>${esc(r.summary)}</pre>
+      ${r.poc ? `<pre>PoC:\n${esc(r.poc)}</pre>` : `<div class="dim" style="margin-top:10px">No PoC — hunter has not paid the second gate.</div>`}
+      ${r.verdict_note ? `<div class="dim" style="margin-top:10px">Verdict: ${esc(r.verdict_note)}</div>` : ""}
+      <div class="acts">
+        <button onclick="verdict('${r.id}','valid')">Valid · refund</button>
+        <button class="ghost" onclick="verdict('${r.id}','duplicate')">Duplicate · refund</button>
+        <button class="ghost" onclick="verdict('${r.id}','out_of_scope')">Out of scope · slash</button>
+        <button class="ghost" onclick="verdict('${r.id}','slop')">Slop · slash</button>
+      </div>
+    </div>`).join("");
+}
+
+async function verdict(id, status){
+  const note = prompt(`Note for "${status}" (optional):`) ?? "";
+  const res = await fetch(`/api/admin/reports/${id}/verdict`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + tok() },
+    body: JSON.stringify({ status, note }),
+  });
+  const out = await res.json();
+  if (!res.ok) { alert("Error: " + JSON.stringify(out)); return; }
+  alert(`${status} — ${out.disposition} (${fmt(out.bondedUsd)}) for ${out.payer}`);
+  load();
+}
+
+document.getElementById("go").onclick = load;
+document.getElementById("filter").onchange = load;
+if (tok()) load();
+// The agent is polling every 5s; keep the queue fresh without a manual reload.
+setInterval(() => { if (tok()) loadApprovals(); }, 5000);
+</script>
+</body>
+</html>

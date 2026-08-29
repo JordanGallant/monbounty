@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bounty402 — protocol</title>
+<style>
+:root{--bg:#0b0910;--panel:#141020;--line:#241c38;--ink:#ece9f5;--dim:#9a92b5;--acc:#836ef9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--acc)}
+.wrap{max-width:760px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:24px;margin:0 0 6px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);margin:34px 0 10px}
+pre{background:#0a0812;border:1px solid var(--line);border-radius:10px;padding:14px;overflow-x:auto;font-size:12.5px;line-height:1.6}
+code{font-family:ui-monospace,Menlo,monospace}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:8px}
+th{text-align:left;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.07em;padding:0 10px 8px}
+td{border-top:1px solid var(--line);padding:9px 10px;vertical-align:top}
+.dim{color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Protocol</h1>
+  <div class="dim"><a href="/">Dashboard</a> · <a href="/triage">Triage</a></div>
+
+  <h2>Why a bond</h2>
+  <p>Writing a plausible vulnerability report now costs roughly nothing; triaging one still costs
+  a security engineer between thirty minutes and three hours. Platforms answered that asymmetry
+  with KYC, rate limits and invite-only programs, which lock out new researchers and legitimate
+  agents alike. Pricing the HTTP request restores skin in the game without an account system.</p>
+
+  <h2>Two gates</h2>
+  <p>Step one buys a triage ticket for the report metadata. Step two, priced at a multiple of the
+  bond, unlocks the proof of concept. A bot that sprays a thousand generated writeups has to fund
+  a thousand second payments, and the report is not queued for a human until it does.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Payment</th></tr>
+    <tr><td>GET</td><td><code>/api/programs</code></td><td class="dim">free</td></tr>
+    <tr><td>GET</td><td><code>/api/stats</code></td><td class="dim">free</td></tr>
+    <tr><td>GET</td><td><code>/api/feed</code></td><td class="dim">free, redacted</td></tr>
+    <tr><td>POST</td><td><code>/api/v1/reports?program=…</code></td><td>x402 · program bond</td></tr>
+    <tr><td>POST</td><td><code>/api/v1/reports/:id/poc</code></td><td>x402 · bond × multiplier</td></tr>
+    <tr><td>GET</td><td><code>/api/v1/reports/:id</code></td><td class="dim">free</td></tr>
+  </table>
+
+  <h2>Flow</h2>
+  <pre><code>POST /api/v1/reports?program=monad-escrow-demo
+  -> 402 Payment Required
+     PAYMENT-REQUIRED: base64({ scheme:"exact", network:"eip155:10143",
+                                asset:"0x534b…43A3", amount:"1000000",
+                                payTo:"0x…", extra:{name:"USDC",version:"2"} })
+
+  client signs an EIP-3009 transferWithAuthorization and retries with X-PAYMENT
+  -> 200 { id, status:"awaiting_poc", contentHash, nextStep:{ url, priceUsd } }
+
+POST /api/v1/reports/:id/poc   (second gate)
+  -> 200 { status:"triaging" }</code></pre>
+
+  <h2>Reputation</h2>
+  <p>A flat bond taxes good researchers to price out bots. Bonds here are priced per hunter
+  from settled history — reports submitted, ruled valid, ruled slop, and bounty actually paid
+  out. The multiplier applies to both gates.</p>
+  <table>
+    <tr><th>Tier</th><th>Earned by</th><th>Bond</th></tr>
+    <tr><td>proven</td><td>3+ valid, ≥50% signal</td><td>×0.35</td></tr>
+    <tr><td>trusted</td><td>1+ valid, ≥34% signal</td><td>×0.6</td></tr>
+    <tr><td>new / unknown</td><td>no settled history</td><td>×1.0</td></tr>
+    <tr><td>penalised</td><td>2+ slop, or slop with no valid</td><td>×2.0</td></tr>
+  </table>
+  <p>Quote your own price with <code>&amp;hunter=0x…</code> on the unpaid probe. That is not a
+  trust decision: the paid retry reprices from the real payer, so claiming someone else's
+  history produces a signed amount that no longer matches the requirements and fails
+  verification. A proven hunter still posts a bond — a discount that reaches zero is exactly
+  what a patient attacker farms.</p>
+
+  <h2>ERC-8004</h2>
+  <p><code>HunterReputation.sol</code> keeps the per-hunter tally on chain so the discount a
+  hunter is quoted can be checked against the same numbers the server used, and mirrors each
+  verdict into an ERC-8004 <code>ReputationRegistry</code> as feedback against their
+  <code>agentId</code> (valid +100, duplicate +25, out of scope −25, slop −100, tagged
+  <code>security-research</code>). Registry writes are try/catch and emit on failure: a
+  registry outage must not block triage or a refund.</p>
+  <p class="dim">Both the registry address and a hunter's agentId are optional. Requiring an
+  ERC-8004 registration to file a bug would exclude the independent researchers the platform
+  exists for.</p>
+
+  <h2>Duplicates</h2>
+  <p>Reports are hashed over program, asset, severity and a normalised bag of summary words, so
+  rewording a submission does not produce a new hash. A duplicate is accepted, marked, and still
+  costs the bond — reposting is not free, which is what stops it being a rational strategy.</p>
+
+  <h2>Refunds and slashing</h2>
+  <p>Valid and good-faith duplicate reports are refunded; hallucinated findings and scanner dumps
+  are slashed to the triage pool. The <code>exact</code> scheme settles straight through to
+  <code>payTo</code>, so with an EOA the refund is an off-chain obligation. Pointing
+  <code>payTo</code> at <code>SubmissionRegistry</code> makes the hold, the refund and the slash
+  enforceable on-chain instead.</p>
+
+  <h2>Settlement</h2>
+  <p>Both Monad networks are live at once. The 402 advertises one <code>accepts</code> entry per
+  network and the payer picks the chain; both gates for one report must settle on the same chain,
+  since one submission is one escrow position.</p>
+  <table>
+    <tr><th></th><th>Testnet</th><th>Mainnet</th></tr>
+    <tr><td>CAIP-2</td><td><code>eip155:10143</code></td><td><code>eip155:143</code></td></tr>
+    <tr><td>USDC</td><td><code>0x534b…43A3</code></td><td><code>0x7547…b603</code></td></tr>
+    <tr><td>Domain</td><td><code>USDC</code> / <code>2</code></td><td><code>USDC</code> / <code>2</code></td></tr>
+  </table>
+  <p class="dim">Facilitator <code>x402-facilitator.molandak.org</code> verifies and submits;
+  this service never holds a signing key.</p>
+</div>
+</body>
+</html>

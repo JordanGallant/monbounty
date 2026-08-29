@@ -1,0 +1,25 @@
+# secrets — NEVER commit
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.local
+**/.env.*.local
+
+# deps / build
+node_modules/
+**/node_modules/
+.bun/
+portal/.next/
+portal/out/
+**/*.tsbuildinfo
+contracts/out/
+contracts/poc/out/
+contracts/lib/
+
+# local data / backups
+data/*.sqlite
+data/*.sqlite-*
+*.bak
+*.log
+cache/

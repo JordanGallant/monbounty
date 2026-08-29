@@ -1,0 +1,15 @@
+[profile.default]
+src = "contracts"
+out = "contracts/out"
+libs = ["contracts/lib"]
+test = "contracts/test"
+solc = "0.8.24"
+optimizer = true
+optimizer_runs = 200
+
+# Sandbox for executing a hunter's proof-of-concept. Isolated so an untrusted
+# PoC cannot reach the registry sources or the project's own tests.
+[profile.poc]
+src = "contracts/poc/src"
+out = "contracts/poc/out"
+test = "contracts/poc/test"
