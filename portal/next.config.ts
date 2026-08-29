@@ -12,6 +12,7 @@ const nextConfig: NextConfig = {
       { source: "/api/:path*", destination: `${BACKEND}/api/:path*` },
       { source: "/skills/:path*", destination: `${BACKEND}/skills/:path*` },
       { source: "/llms.txt", destination: `${BACKEND}/llms.txt` },
+      { source: "/.well-known/:path*", destination: `${BACKEND}/.well-known/:path*` },
     ];
   },
 };

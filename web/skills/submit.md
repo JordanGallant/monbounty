@@ -1,4 +1,4 @@
-# bounty402 — file a report
+# monbounty — file a report
 
 Two paid gates. Gate 1 buys a triage ticket for your finding's metadata. Gate 2 costs
 ×{{POC_MULTIPLIER}} more and is what actually puts you in front of a triager. Nothing is
@@ -6,6 +6,26 @@ queued until gate 2 settles.
 
 That shape is the anti-spam design: a bot that sprays 1,000 generated writeups has to fund
 1,000 *second* payments. Gate 1 alone would just be a paywall.
+
+---
+
+## The easy path — the standalone client does both gates for you
+
+You cannot produce the EIP-3009 payment signature with a plain `curl`. Use the one-file
+hunter client (`curl -sL {{BASE}}/skills/hunt.js -o hunt.js` — no repo, no install), which
+signs both gates in one command:
+
+```bash
+node hunt.js submit \
+  --program <slug> \
+  --finding '{"title":"...","severity":"high","asset":"/api/...","summary":"... (>=80 chars) ..."}' \
+  --poc '{"impact":"web-idor","requests":[{"path":"/api/users/2"}]}'
+```
+
+It validates the writeup locally first (so a bad one never wastes a bond), pays the bond,
+pays the PoC gate, and prints the report status. If your wallet is short it tells you exactly
+what to fund and stops. The rest of this page is the raw protocol, for anyone hand-rolling a
+client instead.
 
 ---
 
@@ -106,11 +126,12 @@ Monad. Its EIP-712 domain is `name: "USDC"`, `version: "2"`,
 
 ## Reference implementation
 
-The whole loop, in working code, in this repo:
+The whole loop, in working code, in the standalone hunter client (`{{HUNTER_REPO}}`) —
+payment tooling only, no target source:
 
 | File | What it does |
 |---|---|
-| `agent/tools.ts` | the toolkit — `check_wallet`, `draft_writeup`, `submit_finding`, `submit_poc`, `request_funding`, `wait_for_funding` |
-| `agent/x402.ts` | the paying client (signer + payment-fetch) |
-| `agent/agent.ts` | a Claude-driven loop over the toolkit |
-| `scripts/agent-flow.ts` | the same sequence scripted, no API key needed |
+| `hunt.ts` | the CLI — `wallet`, `status`, `submit` (both gates) |
+| `x402.ts` | the paying client (signer + payment-fetch) + challenge decode |
+| `wallet.ts` | read-only balance reads + local key; no withdraw path |
+| `config.ts` | Monad network + USDC constants |

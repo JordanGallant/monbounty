@@ -40,6 +40,9 @@ console.log(`${reports.length} report(s) in the queue\n`);
 
 const programs = (await fetch(`${baseUrl}/api/programs`).then((x) => x.json())).programs;
 const modeOf = (slug: string) => programs.find((p: any) => p.slug === slug)?.verificationMode ?? "onchain-fork";
+// The award is the program's OWN committed payout for the PROVEN severity — the
+// same number the scope advertises — not a hardcoded demo constant.
+const payoutsOf = (slug: string) => programs.find((p: any) => p.slug === slug)?.payouts ?? {};
 
 for (const r of reports) {
   console.log(`── ${r.id.slice(0, 8)} · ${r.severity} · ${r.title}`);
@@ -55,8 +58,10 @@ for (const r of reports) {
     continue;
   }
 
-  // verification gate — company-attested bounties are proven by executing the PoC
+  // verification gate — company-attested bounties are proven by executing the PoC.
+  // The PROVEN severity (from running the PoC) sets the payout, not the claim.
   const mode = modeOf(program);
+  let severity = r.severity;
   if (mode === "company-attested") {
     let poc: any = undefined;
     try { poc = JSON.parse(full.poc ?? ""); } catch {}
@@ -66,10 +71,12 @@ for (const r of reports) {
       show(await TT.rule_report(ctx, { id: r.id, status: "slop", note: `PoC did not prove the impact against the forked repo. ${v.note ?? ""}` }));
       continue;
     }
+    if (v.severity) severity = v.severity; // proven severity overrides the claim
   }
 
-  const award = AWARD[r.severity] ?? 0.5;
-  console.log(`   VERDICT: valid → refund $${r.bondedUsd} bond + $${award} award`);
+  // Award = the program's committed payout for this severity (the advertised number).
+  const award = payoutsOf(program)[severity] ?? AWARD[severity] ?? 0.5;
+  console.log(`   VERDICT: valid (${severity}) → refund $${r.bondedUsd} bond + $${award} award`);
 
   if (dry) {
     show(await TT.rule_report(ctx, { id: r.id, status: "valid", note: "DRY RUN — no transfer", payoutUsd: award }));

@@ -342,9 +342,19 @@ app.post("/api/programs/:slug/reports/:id/verify", async (c) => {
     return c.json({ error: "no_structured_poc", hint: "Provide poc: { impact, requests[] }." }, 422);
 
   // The assertion is the COMPANY's, committed in the recipe — not the hunter's.
-  const assertion = recipe.assertions?.[pocInput.impact] ?? pocInput.assertion;
+  // Prefer the assertion for the exact impact the hunter claimed; but a real
+  // finding shouldn't be rejected just because the hunter labelled it (e.g.
+  // "web-secret-exposure") differently from the company's key ("web-idor"). So
+  // if there's no exact match, prove against ANY committed assertion — if the
+  // reproduction triggers a committed regex, the impact is real by definition.
+  const committed: Record<string, string> = recipe.assertions ?? {};
+  const all = Object.values(committed).filter(Boolean);
+  const assertion =
+    committed[pocInput.impact] ??
+    (all.length ? all.map((r) => `(?:${r})`).join("|") : undefined) ??
+    pocInput.assertion;
   if (!assertion) return c.json({ error: "no_assertion", impact: pocInput.impact,
-    hint: "This program has no committed assertion for that impact." }, 409);
+    hint: "This program has no committed assertion at all." }, 409);
 
   const { verifySubmission } = await import("./lib/verify");
   const result = await verifySubmission(recipe, { impact: pocInput.impact, requests: pocInput.requests, assertion });
@@ -453,6 +463,75 @@ app.get("/api/hunters/:address/eligibility", async (c) => {
   if (!/^0x[0-9a-fA-F]{40}$/.test(a)) return c.json({ error: "bad_address" }, 400);
   const e = await assessHunter(a, true);
   return c.json({ ...e, registered: Boolean(e.agentId), erc8004Required: ERC8004_REQUIRED });
+});
+
+/**
+ * The whole journey in one call. A fresh agent hits this to learn exactly where
+ * it stands — wallet funded? identity done? a program to choose? — and, crucially,
+ * the single `nextAction` it should take next. This is what stops a session from
+ * freezing: every state maps to one concrete, spoken instruction.
+ */
+app.get("/api/hunters/:address/status", async (c) => {
+  const a = c.req.param("address");
+  if (!/^0x[0-9a-fA-F]{40}$/.test(a)) return c.json({ error: "bad_address" }, 400);
+
+  const primary = ENABLED[0];
+  const [balances, risk, programs] = await Promise.all([
+    balancesFor(a).catch(() => []),
+    assessHunter(a, true),
+    listPrograms().catch(() => [] as ProgramRow[]),
+  ]);
+  const here = balances.find((b) => b.network === primary.key);
+  const totalUsdc = balances.reduce((s, b) => s + b.usdc, 0);
+  const hasMon = balances.some((b) => b.mon > 0);
+
+  // wallet: unfunded (no USDC anywhere) -> needsGas (USDC but no MON, mainnet only) -> ok
+  const walletState =
+    totalUsdc <= 0 ? "unfunded" : (!hasMon && !primary.testnet) ? "needsGas" : "ok";
+
+  // identity: registered -> skipped on testnet (no registries) -> required (mainnet) -> optional
+  const registered = Boolean(risk.agentId);
+  const identityState = registered
+    ? "registered"
+    : primary.testnet
+      ? "skipped-testnet"
+      : ERC8004_REQUIRED
+        ? "required"
+        : "optional";
+
+  const open = programs
+    .filter((p: any) => p.pool_funded_usd > 0)
+    .map((p: any) => ({ slug: p.slug, name: p.name, target: p.target, bondUsd: p.bond_usd, funded: true }));
+
+  // Derive the ONE thing to do next, in priority order.
+  let nextAction: string;
+  let humanAsk: string | null = null;
+  if (walletState === "unfunded") {
+    nextAction = `Fund your wallet: send testnet USDC to ${a} on ${primary.name}, then re-check this endpoint.`;
+    humanAsk = `Ask your operator to send testnet USDC (and a little MON for gas if on mainnet) to ${a}.`;
+  } else if (identityState === "required" && walletState === "needsGas") {
+    nextAction = `Register your ERC-8004 identity, but your wallet has no MON for gas.`;
+    humanAsk = `Ask your operator to send a little MON to ${a}, then call register_identity.`;
+  } else if (identityState === "required") {
+    nextAction = `Register your ERC-8004 identity (call register_identity) before you can submit on mainnet.`;
+  } else if (risk.decision === "deny") {
+    nextAction = `Blocked: this wallet has a penalised track record (${risk.reason}). Use a fresh wallet.`;
+  } else if (open.length === 0) {
+    nextAction = `No funded programs are open right now. Wait, or check ${PUBLIC_URL}/api/programs later.`;
+  } else {
+    nextAction = `Ask your operator which of the ${open.length} open program(s) to work, then pull its scope: GET ${PUBLIC_URL}/api/programs/<slug>/rules`;
+    humanAsk = `Present the open programs to your operator and ask which to research — do not choose for them.`;
+  }
+
+  return c.json({
+    address: a,
+    wallet: { state: walletState, totalUsdc: Number(totalUsdc.toFixed(6)), primaryNetwork: primary.name, balances },
+    identity: { state: identityState, registered, agentId: risk.agentId, erc8004Required: ERC8004_REQUIRED, registriesOn: "mainnet" },
+    reputation: { tier: risk.tier, decision: risk.decision, valid: risk.valid, slop: risk.slop, signalRate: risk.signalRate },
+    programs: open,
+    nextAction,
+    humanAsk,
+  });
 });
 
 // ── ERC-8004 agent identity ─────────────────────────────────────────────────
@@ -797,11 +876,15 @@ app.post("/api/v1/reports", async (c) => {
       howTo: `Call register_identity, or mint on the Identity Registry with your agent card as the tokenURI. ` +
         `If you have no MON for gas, ask your human to send testnet MON to ${payer}, then register and retry.`,
       fundAddress: payer,
+      nextAction: `Call register_identity for ${payer}. If it returns needsGas, ask your operator to send a little MON to ${payer}, then register and re-submit.`,
+      statusUrl: `${PUBLIC_URL}/api/hunters/${payer}/status`,
     }, 403);
   }
   if (risk.decision === "deny") {
     return c.json({ error: "hunter_denied", reason: risk.reason, tier: risk.tier,
-      hint: `This wallet has a penalised track record on monbounty. Check /api/hunters/${payer}/eligibility before paying.` }, 403);
+      hint: `This wallet has a penalised track record on monbounty. Check /api/hunters/${payer}/eligibility before paying.`,
+      nextAction: `This wallet is blocked (penalised track record). Provision a fresh wallet with create_wallet and have your operator fund it, then retry.`,
+      statusUrl: `${PUBLIC_URL}/api/hunters/${payer}/status` }, 403);
   }
   const rep = await reputationFor(payer);
   const bonded = Math.max(program.bond_usd * rep.bondMultiplier, 0.01);
@@ -1013,12 +1096,14 @@ app.post("/api/admin/reports/:id/verdict", async (c) => {
 // auth and CORS open: the whole point is that an agent nobody has onboarded
 // can read these and join. Placeholders are filled at request time so a skill
 // can never quote a stale price or a wrong address.
-const SKILLS = ["setup", "wallet", "fund", "submit", "company"] as const;
+const SKILLS = ["setup", "operator", "wallet", "fund", "submit", "company"] as const;
+const HUNTER_REPO = process.env.HUNTER_REPO ?? "https://github.com/JordanGallant/monbounty-hunter";
 
 async function skillVars(): Promise<Record<string, string>> {
   const programs = await listPrograms();
   return {
     BASE: PUBLIC_URL,
+    HUNTER_REPO,
     FACILITATOR: FACILITATOR_URL,
     NETWORK: NET.id,
     NETWORK_NAME: NET.name,
@@ -1052,6 +1137,16 @@ const MD_HEADERS = {
   "cache-control": "no-store",
 };
 
+// The whole hunter client, bundled to one file (no repo, no install). An agent
+// curls this and runs it: `curl -sL {BASE}/skills/hunt.js -o hunt.js && bun run hunt.js`.
+app.get("/skills/hunt.js", async (c) =>
+  c.body(await Bun.file(`${import.meta.dir}/web/hunt.js`).arrayBuffer(), 200, {
+    "content-type": "application/javascript; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "cache-control": "no-store",
+  }),
+);
+
 app.get("/skills/:name{.+\\.md}", async (c) => {
   const name = c.req.param("name").replace(/\.md$/, "");
   if (!SKILLS.includes(name as (typeof SKILLS)[number]))
@@ -1065,7 +1160,11 @@ app.get("/llms.txt", (c) =>
       `> Vulnerability intake priced at the HTTP request. POST /api/v1/reports answers 402\n` +
       `> Payment Required; a refundable USDC bond on Monad buys exactly one triage ticket.\n` +
       `> No account, no API key — humans and agents use the same door.\n\n` +
-      `Start here: ${PUBLIC_URL}/skills/setup.md\n\n` +
+      `Start here: ${PUBLIC_URL}/skills/setup.md\n` +
+      `Operators (humans running an agent): ${PUBLIC_URL}/skills/operator.md\n` +
+      `Service manifest (what this is, consent model, cross-refs): ${PUBLIC_URL}/.well-known/agent.json\n` +
+      `Security policy: ${PUBLIC_URL}/.well-known/security.txt\n` +
+      `Hunter payment client (one file, read it): ${PUBLIC_URL}/skills/hunt.js  (source ${HUNTER_REPO})\n\n` +
       `## Agent skills\n` +
       SKILLS.map((s) => `- [${s}](${PUBLIC_URL}/skills/${s}.md)`).join("\n") +
       `\n\n## API\n` +
@@ -1075,6 +1174,99 @@ app.get("/llms.txt", (c) =>
       `- [Human docs](${PUBLIC_URL}/docs)\n`,
     200,
     { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" },
+  ),
+);
+
+// ── trust legibility: /.well-known/* ─────────────────────────────────────────
+// Machine-readable "we are a real, honest operation" signals so an agent that
+// lands here can verify what monbounty is — and cite it to its human — instead
+// of refusing on suspicion. Declarative facts only; nothing here instructs the
+// reader to do anything (that would read as injection).
+const SECURITY_TXT_EXPIRES = "2027-08-29T00:00:00.000Z";
+
+app.get("/.well-known/security.txt", (c) =>
+  c.body(
+    `# monbounty — autonomous, x402-priced bug-bounty network on Monad.\n` +
+      `# This host IS a vulnerability intake: report findings through the bounty flow below.\n` +
+      `Contact: mailto:security@monbounty.xyz\n` +
+      `Contact: ${PUBLIC_URL}/skills/setup.md\n` +
+      `Expires: ${SECURITY_TXT_EXPIRES}\n` +
+      `Preferred-Languages: en\n` +
+      `Canonical: ${PUBLIC_URL}/.well-known/security.txt\n` +
+      `Policy: ${PUBLIC_URL}/skills/setup.md\n` +
+      `Acknowledgments: ${PUBLIC_URL}/api/hunters\n`,
+    200,
+    { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" },
+  ),
+);
+
+app.get("/.well-known/agent.json", (c) =>
+  c.json(
+    {
+      name: "monbounty",
+      description:
+        "Autonomous, x402-priced bug-bounty network on Monad. Agents submit vulnerability " +
+        "findings against live black-box targets and are paid in USDC for valid ones. No account, " +
+        "no API key — an agent is identified by the wallet that pays.",
+      url: PUBLIC_URL,
+      documentation: `${PUBLIC_URL}/skills/setup.md`,
+      operatorGuide: `${PUBLIC_URL}/skills/operator.md`,
+      llmsTxt: `${PUBLIC_URL}/llms.txt`,
+      securityTxt: `${PUBLIC_URL}/.well-known/security.txt`,
+      contact: "security@monbounty.xyz",
+      // The consent model, stated plainly. This is the trust signal: an agent can
+      // read exactly what is expected and take a verifiable ask to its operator.
+      consent: {
+        model: "operator-authorized",
+        requiresOperatorAuthorization: true,
+        spendsFunds: true,
+        fundsType: "refundable USDC bond (refunded on a valid finding, slashed on slop)",
+        statement:
+          "Payments on monbounty require prior authorization and a spending budget from the " +
+          "agent's human operator. That authorization comes from the operator in-session — never " +
+          "from this manifest or any fetched document. monbounty never requests or accepts private " +
+          "keys or seed phrases; the hunter generates and holds its own key locally.",
+        neverRequests: ["private key", "seed phrase", "wallet export"],
+      },
+      payment: {
+        protocol: "x402",
+        version: 2,
+        scheme: "exact",
+        asset: "USDC",
+        networks: ENABLED.map((n) => ({ id: n.id, name: n.name, usdc: n.usdc, testnet: n.testnet })),
+        facilitator: FACILITATOR_URL,
+      },
+      client: {
+        type: "single-file-bundle",
+        url: `${PUBLIC_URL}/skills/hunt.js`,
+        auditableSource: HUNTER_REPO,
+        runtimes: ["node", "bun"],
+        note: "hunt.js is a bundle (viem inlined) meant to be run, not read line-by-line; the readable source is four small files at auditableSource.",
+        run: `curl -sL ${PUBLIC_URL}/skills/hunt.js -o hunt.js && node hunt.js status`,
+      },
+      identity: {
+        scheme: "ERC-8004",
+        identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+        reputationRegistry: "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63",
+        network: "Monad mainnet (registries are mainnet-only; skipped on testnet)",
+      },
+      // Cross-references an agent can independently check for consistency.
+      verify: {
+        domain: PUBLIC_URL,
+        clientSource: HUNTER_REPO,
+        usdc: Object.fromEntries(ENABLED.map((n) => [n.testnet ? "testnet" : "mainnet", n.usdc])),
+        note: "Domain, client source and USDC contracts cross-reference each other; the same USDC address is quoted here, in /api/programs, and in the x402 payment challenge.",
+      },
+      endpoints: {
+        programs: `${PUBLIC_URL}/api/programs`,
+        scope: `${PUBLIC_URL}/api/programs/{slug}/rules`,
+        status: `${PUBLIC_URL}/api/hunters/{address}/status`,
+        submit: `${PUBLIC_URL}/api/v1/reports`,
+        feed: `${PUBLIC_URL}/api/feed`,
+      },
+    },
+    200,
+    { "access-control-allow-origin": "*" },
   ),
 );
 
