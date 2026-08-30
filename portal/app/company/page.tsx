@@ -64,7 +64,7 @@ export default function CompanyPortal() {
   const [ruler, setRuler] = useState("");
   const [vmode, setVmode] = useState<"onchain-fork" | "company-attested">("onchain-fork");
   const [repo, setRepo] = useState("");
-  const [runCmd, setRunCmd] = useState("bun run demo-target/server.js");
+  const [runCmd, setRunCmd] = useState("bun run server.js");
   const [buildCmd, setBuildCmd] = useState("");
   const [assertions, setAssertions] = useState<Record<string, string>>({});
   const [created, setCreated] = useState<CreatedBounty | null>(null);
@@ -276,7 +276,7 @@ export default function CompanyPortal() {
                   <div className="grid gap-1.5"><Label>Build command (optional)</Label>
                     <Input value={buildCmd} onChange={(e) => setBuildCmd(e.target.value)} placeholder="bun install" /></div>
                   <div className="grid gap-1.5"><Label>Run command</Label>
-                    <Input value={runCmd} onChange={(e) => setRunCmd(e.target.value)} placeholder="bun run demo-target/server.js" /></div>
+                    <Input value={runCmd} onChange={(e) => setRunCmd(e.target.value)} placeholder="bun run server.js" /></div>
                 </div>
                 {[...picked].length > 0 && (
                   <div className="grid gap-2">

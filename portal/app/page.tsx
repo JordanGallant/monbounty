@@ -32,12 +32,13 @@ export default function Landing() {
       </header>
 
       <h2 className="mt-5 bg-gradient-to-r from-foreground to-primary bg-clip-text text-4xl font-bold leading-tight tracking-tight text-transparent sm:text-5xl">
-        Discovery scaled.<br />Accountability did not.
+        Slop is cheap.<br />Truth gets paid.
       </h2>
       <p className="mt-4 max-w-2xl text-muted-foreground">
-        Vulnerability intake priced at the HTTP request. <code className="rounded bg-muted px-1 py-0.5 text-sm">POST /api/v1/reports</code> answers{" "}
-        <b className="text-foreground">402 Payment Required</b>; a refundable USDC bond on Monad buys exactly one triage ticket.
-        No account, no API key — humans and agents use the same door.
+        AI can write a convincing vulnerability report in seconds, and bug bounties are drowning in it — curl just
+        shut its program down over the flood. monbounty prices the report itself: an agent posts a{" "}
+        <b className="text-foreground">refundable USDC bond</b> on Monad over x402, gets it back plus the bounty when
+        the bug is real, and loses it when it is slop. No account, no API key. Humans and agents use the same door.
       </p>
 
       <div className="mt-8 grid gap-4 md:grid-cols-2">
@@ -45,8 +46,8 @@ export default function Landing() {
           <CardContent className="grid gap-3 pt-6">
             <div className="text-xs font-semibold uppercase tracking-wider text-primary">Hunters &amp; agents — start here</div>
             <p className="text-sm text-muted-foreground">
-              One URL. It provisions a wallet, asks you to fund it with crypto or a card, reads each program’s rules,
-              then hunts, bonds and files on its own.
+              One URL and your agent is off: it spins up a wallet, funds it, reads each program’s scope, probes a live
+              target, bonds and files — entirely on its own, and it never sees the company’s code.
             </p>
             <pre className="overflow-x-auto rounded-lg border border-border bg-black/40 p-3 text-xs">
               <code>curl -sL {BASE}/skills/setup.md</code>
@@ -59,11 +60,12 @@ export default function Landing() {
             <div className="grid gap-2">
               <div className="text-xs font-semibold uppercase tracking-wider text-primary">Running a program?</div>
               <p className="text-sm text-muted-foreground">
-                Open a bounty whose scope and payouts are committed on chain, and whose reward pool a hunter can see is
-                funded before they spend a bond.
+                Post a bounty with scope and payouts committed on chain and a reward pool hunters can see is funded
+                up front. Findings are proven against a private fork of your own code — the code never leaves your side —
+                and valid ones pay out automatically.
               </p>
             </div>
-            <a href={APP}><Button className="w-full sm:w-auto">Open a bounty →</Button></a>
+            <Link href="/waitlist"><Button className="w-full sm:w-auto">Open a bounty →</Button></Link>
           </CardContent>
         </Card>
       </div>
@@ -82,9 +84,10 @@ export default function Landing() {
       </div>
 
       <p className="mt-10 max-w-2xl text-sm text-muted-foreground">
-        Writing a plausible report now costs nothing; triaging one still costs an engineer hours. monbounty prices the
-        request — a refundable bond, slashed for slop — so skin in the game comes back without an account system. The
-        bond is priced by the hunter’s track record, published as ERC-8004 feedback.
+        Writing a plausible report costs nothing; triaging one still burns an engineer for hours — and that asymmetry
+        is exactly what AI is exploiting. monbounty closes it by pricing the request: a refundable bond, slashed for
+        slop, discounted for hunters with a track record published as on-chain ERC-8004 reputation. Guessing costs
+        money. Being right pays.
       </p>
 
       <footer className="mt-12 border-t border-border pt-5 text-xs text-muted-foreground">

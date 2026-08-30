@@ -136,6 +136,18 @@ export const ready: Promise<void> = (async () => {
      ALTER TABLE reports ADD COLUMN IF NOT EXISTS payout_tx TEXT;`,
   );
 
+  // Company waitlist — prospective companies from the landing "Open a bounty" form.
+  await db.exec(
+    `CREATE TABLE IF NOT EXISTS waitlist (
+       id         TEXT PRIMARY KEY,
+       company    TEXT,
+       email      TEXT NOT NULL,
+       website    TEXT,
+       message    TEXT,
+       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+     );`,
+  );
+
   // Company side: a program IS a bounty. These columns carry the committed
   // rules, the on-chain hash, the escrowed pool and the SLA. Added idempotently
   // so an existing programs table upgrades in place.

@@ -53,6 +53,13 @@ function LoginForm() {
             {err && <Alert variant="destructive"><AlertDescription>{err}</AlertDescription></Alert>}
             <Button type="submit" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</Button>
           </form>
+          <p className="mt-4 border-t pt-4 text-center text-xs leading-relaxed text-muted-foreground">
+            Sign-up is invite-only. To run a bounty on monbounty, email{" "}
+            <a href="mailto:jordan.gallant.nl@gmail.com" className="font-medium underline underline-offset-2">
+              jordan.gallant.nl@gmail.com
+            </a>{" "}
+            to get onboarded.
+          </p>
         </CardContent>
       </Card>
     </main>
