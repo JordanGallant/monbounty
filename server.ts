@@ -337,9 +337,22 @@ app.post("/api/programs/:slug/reports/:id/verify", async (c) => {
   const body = await c.req.json().catch(() => ({}) as any);
   // The reproduction (requests + claimed impact) — from the request, or the stored PoC as JSON.
   let pocInput: any = body?.poc;
-  if (!pocInput && report.poc) { try { pocInput = JSON.parse(report.poc); } catch {} }
+  if (!pocInput && report.poc) { try { pocInput = JSON.parse(report.poc); } catch { pocInput = { poc: report.poc }; } } // prose PoC -> keep raw text for path extraction
+  // Agents often write a PoC as prose / curl steps ({ steps:[...], notes }) rather
+  // than { impact, requests[] }. Coerce any recognisable request paths out of it so
+  // a real finding isn't rejected on formatting alone.
+  if (pocInput && !Array.isArray(pocInput.requests)) {
+    const blob = Array.isArray(pocInput.steps) ? pocInput.steps.join("\n")
+      : typeof pocInput.poc === "string" ? pocInput.poc : JSON.stringify(pocInput ?? {});
+    const paths = new Set();
+    for (const m of blob.matchAll(/https?:\/\/[^\s"'`]+/g)) { try { const u = new URL(m[0]); paths.add(u.pathname + (u.search || "")); } catch {} }
+    for (const m of blob.matchAll(/(?<![\w:])\/api\/[A-Za-z0-9_\-\/.%?=&]*/g)) paths.add(m[0]);
+    const list = [...paths].filter((p) => p && p !== "/");
+    if (list.length) pocInput.requests = list.map((p) => ({ path: p, method: "GET" }));
+  }
+  if (pocInput && !pocInput.impact) pocInput.impact = "web-idor";
   if (!pocInput?.requests || !pocInput?.impact)
-    return c.json({ error: "no_structured_poc", hint: "Provide poc: { impact, requests[] }." }, 422);
+    return c.json({ error: "no_structured_poc", hint: "Provide poc: { impact, requests[] } or steps with request paths." }, 422);
 
   // The assertion is the COMPANY's, committed in the recipe — not the hunter's.
   // Prefer the assertion for the exact impact the hunter claimed; but a real
@@ -1152,6 +1165,26 @@ app.get("/skills/:name{.+\\.md}", async (c) => {
   if (!SKILLS.includes(name as (typeof SKILLS)[number]))
     return c.text(`Unknown skill. Available: ${SKILLS.map((s) => `${s}.md`).join(", ")}\n`, 404);
   return c.body(await renderSkill(name), 200, MD_HEADERS);
+});
+
+// ── company waitlist (landing "Open a bounty" form) ──────────────────────────
+app.post("/api/waitlist", async (c) => {
+  let b: any; try { b = await c.req.json(); } catch { return c.json({ error: "bad_json" }, 400); }
+  const email = String(b?.email ?? "").trim();
+  const company = String(b?.company ?? "").trim();
+  const website = b?.website ? String(b.website).trim() : null;
+  const message = b?.message ? String(b.message).trim() : null;
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return c.json({ error: "bad_email" }, 422);
+  if (company.length < 2) return c.json({ error: "company_required" }, 422);
+  const id = crypto.randomUUID();
+  await db.run("INSERT INTO waitlist (id, company, email, website, message) VALUES (?,?,?,?,?)",
+    [id, company, email, website, message]);
+  return c.json({ ok: true, id });
+});
+app.get("/api/admin/waitlist", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const rows = await db.query("SELECT * FROM waitlist ORDER BY created_at DESC").all();
+  return c.json({ total: rows.length, entries: rows });
 });
 
 app.get("/llms.txt", (c) =>

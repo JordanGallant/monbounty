@@ -48,8 +48,18 @@ export interface VerifyResult {
   error?: string;
 }
 
-const sh = (cmd: string, cwd: string, timeoutMs: number) =>
-  Bun.spawn(["bash", "-lc", cmd], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env } });
+// Cloned repo code runs with a MINIMAL env — the host's secrets (TREASURY_PRIVATE_KEY,
+// ADMIN_TOKEN, DB creds, …) are NEVER placed in its environment. Only PATH/HOME/LANG,
+// plus PORT for the run step. (The backend service is itself systemd-sandboxed —
+// RestrictNamespaces/NoNewPrivileges — which is why a nested bwrap FS sandbox can't run
+// here; a dedicated secrets-free verifier service is the path to full FS isolation.)
+const MIN_ENV: Record<string, string> = {
+  PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+  HOME: "/tmp",
+  LANG: process.env.LANG ?? "C.UTF-8",
+};
+const sh = (cmd: string, cwd: string, _workRoot: string, env: Record<string, string> = {}) =>
+  Bun.spawn(["bash", "-lc", cmd], { cwd, stdout: "pipe", stderr: "pipe", env: { ...MIN_ENV, ...env } });
 
 async function waitPort(url: string, deadline: number, log: string[]): Promise<boolean> {
   while (Date.now() < deadline) {
@@ -70,14 +80,14 @@ export async function verifySubmission(recipe: VerifyRecipe, poc: Poc): Promise<
   try {
     // 1. fork: shallow clone the company's repo
     log.push(`git clone --depth 1 ${recipe.ref ? "-b " + recipe.ref + " " : ""}${recipe.repo}`);
-    const clone = sh(`git clone --depth 1 ${recipe.ref ? `-b ${recipe.ref} ` : ""}${recipe.repo} app`, dir, 90_000);
+    const clone = sh(`git clone --depth 1 ${recipe.ref ? `-b ${recipe.ref} ` : ""}${recipe.repo} app`, dir, dir);
     if ((await clone.exited) !== 0) { log.push("clone failed: " + (await new Response(clone.stderr).text()).slice(0, 300)); return fail(); }
     const app = join(dir, "app");
 
     // 2. build
     if (recipe.buildCmd) {
       log.push(`build: ${recipe.buildCmd}`);
-      const b = sh(recipe.buildCmd, app, 180_000);
+      const b = sh(recipe.buildCmd, app, dir);
       const code = await b.exited;
       if (code !== 0) { log.push("build failed: " + (await new Response(b.stderr).text()).slice(0, 300)); return fail(); }
     }
@@ -85,7 +95,7 @@ export async function verifySubmission(recipe: VerifyRecipe, poc: Poc): Promise<
     // 3. run the fork (throwaway deploy)
     if (recipe.runCmd) {
       log.push(`run: PORT=${port} ${recipe.runCmd}`);
-      proc = Bun.spawn(["bash", "-lc", recipe.runCmd], { cwd: app, env: { ...process.env, PORT: String(port) }, stdout: "pipe", stderr: "pipe" });
+      proc = sh(recipe.runCmd, app, dir, { PORT: String(port) });
       const ready = await waitPort(base + (recipe.healthPath ?? "/"), Date.now() + (recipe.bootSec ?? 25) * 1000, log);
       if (!ready) return fail();
       log.push("app is up");

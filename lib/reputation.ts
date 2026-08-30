@@ -43,7 +43,7 @@ const TIERS: Record<Tier, number> = {
 };
 
 export function tierFor(r: Omit<Reputation, "tier" | "bondMultiplier">): Tier {
-  const triaged = r.valid + r.duplicate + r.outOfScope + r.slop;
+  const triaged = r.valid + r.outOfScope + r.slop; // duplicates excluded — see reputationFor
   if (triaged === 0) return r.submitted === 0 ? "unknown" : "new";
   // Recent slop dominates: two junk reports undo a good history, otherwise the
   // discount becomes a subsidy for whoever farmed it first.
@@ -86,7 +86,9 @@ export async function reputationFor(address: string): Promise<Reputation> {
     firstSeen: hunter?.first_seen ?? null,
     agentId: hunter?.agent_id ?? null,
   };
-  const triaged = base.valid + base.duplicate + base.outOfScope + base.slop;
+  // Duplicates are reputation-neutral: the hunter found a REAL bug, someone just filed it
+  // first. It must not dent their signal or ERC-8004 standing. Excluded from the denominator.
+  const triaged = base.valid + base.outOfScope + base.slop;
   base.signalRate = triaged ? Number(((base.valid / triaged) * 100).toFixed(1)) : null;
 
   const tier = tierFor(base);

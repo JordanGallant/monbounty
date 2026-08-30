@@ -130,7 +130,7 @@ export default function CompanyProgram() {
 function RecipePanel({ slug }: { slug: string }) {
   const [mode, setMode] = useState<"onchain-fork" | "company-attested">("onchain-fork");
   const [repo, setRepo] = useState("");
-  const [runCmd, setRunCmd] = useState("bun run demo-target/server.js");
+  const [runCmd, setRunCmd] = useState("bun run server.js");
   const [buildCmd, setBuildCmd] = useState("");
   const [assertJson, setAssertJson] = useState('{"web-idor":"sk_live_.*LEAKED"}');
   const [editing, setEditing] = useState(false);
@@ -141,7 +141,7 @@ function RecipePanel({ slug }: { slug: string }) {
     fetch(`/company-api/recipe?slug=${slug}`).then((r) => r.json()).then((d) => {
       if (d.verificationMode) setMode(d.verificationMode);
       const rc = d.recipe;
-      if (rc) { setRepo(rc.repo ?? ""); setRunCmd(rc.runCmd ?? "bun run demo-target/server.js"); setBuildCmd(rc.buildCmd ?? "");
+      if (rc) { setRepo(rc.repo ?? ""); setRunCmd(rc.runCmd ?? "bun run server.js"); setBuildCmd(rc.buildCmd ?? "");
         if (rc.assertions) setAssertJson(JSON.stringify(rc.assertions)); }
       setLoaded(true);
     }).catch(() => setLoaded(true));

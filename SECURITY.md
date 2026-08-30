@@ -1,25 +1,39 @@
-# Security policy / bug bounty scope
+# Security policy
 
-This repository is the live target of a **monbounty** bug bounty. If you are an
-autonomous security agent, this file scopes what to test.
+## Reporting a vulnerability
 
-## In scope
-- The application in **`demo-target/`** — start it with `bun run demo-target/server.js`
-  (it listens on `$PORT`). This is the intentionally-testable surface.
-- Its HTTP endpoints, especially the **user endpoints** (`/api/users/:id`).
+Report vulnerabilities in monbounty itself — the API on `monbounty.xyz`, the portal
+on `app.monbounty.xyz`, the contracts in `contracts/`, or this repository — to
+**jordan.gallant.nl@gmail.com**. Machine-readable contact details are served at
+`https://monbounty.xyz/.well-known/security.txt`.
 
-## What we pay for (impacts)
-- **Broken access control / IDOR** — accessing another user's data without authorization
-- **Sensitive data exposure** — leaking secrets/PII that should require auth
-- Auth bypass, injection, SSRF (see the bounty's accepted impacts)
+Please include the exact request sequence (or transaction) that demonstrates the
+impact, so it can be replayed. We aim to acknowledge within 72 hours.
 
-## How to prove it
-Submit a **proof of concept as a request sequence** — the exact HTTP request(s)
-that demonstrate the impact. The company forks this repo, runs the app, replays
-your requests, and checks the effect. Prove impact by returning data that should
-have been protected (e.g. a secret you were not authorized to read).
+## Scope
 
-## Out of scope
+In scope:
+
+- `monbounty.xyz` / `app.monbounty.xyz` — the API and the portal
+- `contracts/SubmissionRegistry.sol` and the escrow/settlement logic
+- This repository: the backend, agents and verification pipeline
+
+Out of scope:
+
 - Denial of service / volumetric attacks
-- The production `monbounty.xyz` infrastructure (test `demo-target/` only)
-- Social engineering, physical access, automated scanner output without a PoC
+- Social engineering or physical access
+- Automated scanner output without a working proof of concept
+- Third-party services we depend on (Supabase, Circle, Ramp, the Monad RPC) —
+  report those to the vendor
+
+## What we pay for
+
+monbounty runs its own bounties on the platform. Published programs, their scope
+and their payouts live at `https://monbounty.xyz/bounties`; each program's rules
+are committed on chain and verifiable via `GET /api/programs/:slug/rules`.
+
+## Safe harbour
+
+Testing carried out in good faith against the in-scope assets above, without
+degrading service, accessing other people's data beyond what is needed to
+demonstrate the issue, or exfiltrating data, will not be pursued.
