@@ -7,9 +7,15 @@
  * ERC-20 transfer the treasury signs itself — which is why this wallet needs
  * MON for gas, and the hunter wallet does not.
  */
-import { createPublicClient, createWalletClient, http, erc20Abi, parseUnits, formatUnits } from "viem";
+import { createPublicClient, createWalletClient, http, erc20Abi, parseUnits, formatUnits, parseAbi } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { NETWORKS, type MonadNet, type NetKey } from "../lib/config";
+
+// EIP-3009 signature-bytes variant, as Circle's USDC exposes it. Lets the
+// treasury BROADCAST a transfer the wallet SIGNED — the wallet pays no gas.
+const EIP3009_ABI = parseAbi([
+  "function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, bytes signature)",
+]);
 
 export interface Payout {
   ok: boolean;
@@ -79,6 +85,34 @@ export class Treasury {
       return { ok: true, txHash: hash, explorerUrl: `${net.explorer}/tx/${hash}`, amountUsd, to, network };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e), amountUsd, to, network };
+    }
+  }
+
+  /**
+   * Broadcast an EIP-3009 transfer that a managed wallet already SIGNED (the
+   * gasless payout path). The treasury pays the gas; the money moves from the
+   * hunter's wallet to their bound address. Used by /wallets/:id/payout.
+   */
+  async submitTransferAuthorization(
+    network: NetKey,
+    auth: { from: string; to: string; value: bigint; validAfter: bigint; validBefore: bigint; nonce: `0x${string}` },
+    signature: `0x${string}`,
+  ): Promise<{ ok: boolean; txHash?: string; explorerUrl?: string; error?: string }> {
+    const net = NETWORKS[network];
+    const bal = await this.balance(network);
+    if (bal.mon <= 0) return { ok: false, error: "treasury_no_gas (needs MON to broadcast the payout)" };
+    try {
+      const hash = await this.wallet(net).writeContract({
+        address: net.usdc as `0x${string}`,
+        abi: EIP3009_ABI,
+        functionName: "transferWithAuthorization",
+        args: [auth.from as `0x${string}`, auth.to as `0x${string}`, auth.value, auth.validAfter, auth.validBefore, auth.nonce, signature],
+        chain: null,
+      });
+      await this.pub(net).waitForTransactionReceipt({ hash });
+      return { ok: true, txHash: hash, explorerUrl: `${net.explorer}/tx/${hash}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
 }

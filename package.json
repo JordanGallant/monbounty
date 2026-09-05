@@ -10,11 +10,16 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
     "@circle-fin/developer-controlled-wallets": "^10.8.0",
+    "@solana/kit": "8.2.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.98.4",
     "@x402/core": "^2.24.0",
     "@x402/evm": "^2.24.0",
     "@x402/fetch": "^2.24.0",
     "@x402/hono": "^2.24.0",
+    "@x402/svm": "2.24.0",
     "hono": "^4.6.0",
+    "stripe": "^17.5.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {

@@ -21,7 +21,7 @@
 import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
 import type { MonadNet } from "./config";
 
-export type CircleChain = "MONAD" | "MONAD-TESTNET";
+export type CircleChain = "MONAD" | "MONAD-TESTNET" | "SOL" | "SOL-DEVNET";
 
 /** Circle's chain identifier for one of our configured Monad networks. */
 export const circleChain = (net: MonadNet): CircleChain =>
@@ -86,8 +86,41 @@ export async function createWallet(net: MonadNet): Promise<CircleWallet> {
  * `data` must be a JSON *string*, not an object; the API rejects an object.
  */
 export async function signTypedData(walletId: string, typedData: unknown): Promise<`0x${string}`> {
-  const r = await sdk().signTypedData({ walletId, data: JSON.stringify(typedData) });
+  // EIP-712 messages carry uint256 fields as BigInt (chainId, value, validAfter…);
+  // JSON can't serialize BigInt, and Circle expects them as decimal strings.
+  const data = JSON.stringify(typedData, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  const r = await sdk().signTypedData({ walletId, data });
   const sig = r.data?.signature;
   if (!sig) throw new Error("circle_sign_failed");
   return sig as `0x${string}`;
+}
+
+/** Provision one fresh hunter wallet on Solana (devnet by default). */
+export async function createSolanaWallet(devnet = true): Promise<CircleWallet> {
+  const chain: CircleChain = devnet ? "SOL-DEVNET" : "SOL";
+  const r = await sdk().createWallets({
+    accountType: "EOA",
+    blockchains: [chain],
+    count: 1,
+    walletSetId: await ensureWalletSet(),
+  });
+  const w = r.data?.wallets?.[0];
+  if (!w?.id || !w?.address) throw new Error("circle_solana_wallet_create_failed");
+  return { walletId: w.id, address: w.address, chain }; // Solana addresses are case-sensitive
+}
+
+/**
+ * Sign a Solana transaction with a Circle-held key. `transaction` is the
+ * base64-encoded unsigned (or partially-signed) transaction; Circle returns the
+ * signed transaction, which the x402 SVM payload carries to the facilitator.
+ */
+export async function signSolanaTransaction(
+  walletId: string, transaction: string,
+): Promise<{ signedTransaction: string; signature: string | null }> {
+  // `rawTransaction` (base64 wire tx), NOT `transaction` (which expects a JSON
+  // transaction object) — passing base64 as `transaction` yields "API parameter invalid".
+  const r = await sdk().signTransaction({ walletId, rawTransaction: transaction } as any);
+  const signed = r.data?.signedTransaction;
+  if (!signed) throw new Error("circle_solana_sign_failed");
+  return { signedTransaction: signed, signature: (r.data as any)?.signature ?? null };
 }

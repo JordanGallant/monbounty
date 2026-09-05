@@ -15,7 +15,18 @@ export async function middleware(request: NextRequest) {
 
   const host = request.headers.get("host") ?? "";
   const isAppHost = host.startsWith("app.");
+  const isDemoHost = host.startsWith("demo.");
   const { response, user } = await updateSession(request);
+
+  // demo.monbounty.xyz — a public, no-auth "both sides" walkthrough; root -> /demo.
+  if (isDemoHost) {
+    if (pathname === "/") {
+      const url = request.nextUrl.clone();
+      url.pathname = "/demo";
+      return NextResponse.rewrite(url);
+    }
+    return response;
+  }
 
   const needsAuth = pathname.startsWith("/dashboard") || pathname.startsWith("/company") || (isAppHost && pathname !== "/login");
 

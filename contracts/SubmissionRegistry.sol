@@ -219,6 +219,79 @@ contract SubmissionRegistry {
         owner = next;
     }
 
+    // --- commit-reveal (provable priority + private PoC) ------------------
+
+    struct Commit { address by; uint64 at; bool consumed; }
+
+    /// commitHash => the sealed claim. `at==0` means "never seen".
+    mapping(bytes32 => Commit) public commits;
+    /// submissionId => the commit timestamp that gives it priority (0 = none).
+    mapping(bytes32 => uint64) public priorityAt;
+    /// contentHash => the earliest commit seen for it. The winner of a duplicate.
+    mapping(bytes32 => bytes32) public firstCommitFor;
+
+    event Committed(bytes32 indexed commitHash, address indexed by, uint64 at);
+    event Revealed(bytes32 indexed id, bytes32 indexed commitHash, bytes32 contentHash, uint64 priorityAt);
+
+    error CommitExists();
+    error UnknownCommit();
+    error CommitConsumed();
+    error BadReveal();
+
+    /// The hash a hunter seals before revealing: finder + program + finding + salt.
+    function commitHashFor(address by, bytes32 program, bytes32 contentHash, bytes32 salt)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(by, program, contentHash, salt));
+    }
+
+    /**
+     * Stake a claim on a finding before disclosing it. The hash leaks nothing
+     * and costs almost nothing, but timestamps priority on chain. When two
+     * hunters find the same bug, the earlier commit is provably first -- so a
+     * "duplicate" becomes an ordering fact rather than the company's word, and
+     * being second by a block is something the loser can prove, not eat.
+     *
+     * Anyone may commit: it is the reveal (record) that must match the payer.
+     */
+    function commit(bytes32 commitHash) external {
+        if (commits[commitHash].at != 0) revert CommitExists();
+        commits[commitHash] = Commit({ by: msg.sender, at: uint64(block.timestamp), consumed: false });
+        emit Committed(commitHash, msg.sender, uint64(block.timestamp));
+    }
+
+    /**
+     * Reveal-and-record: bind an x402 payment to a report AND redeem a prior
+     * commit, stamping the submission with the commit's timestamp as its
+     * priority. Same money path as record(); the only extra is that duplicate
+     * ordering is now on chain. `salt` must reproduce the committed hash, and
+     * the commit must have been sealed by this payer.
+     */
+    function recordRevealed(
+        bytes32 id,
+        address payer,
+        bytes32 program,
+        uint256 amount,
+        bytes32 contentHash,
+        bytes32 salt
+    ) external onlyOwner {
+        bytes32 h = commitHashFor(payer, program, contentHash, salt);
+        Commit storage c = commits[h];
+        if (c.at == 0) revert UnknownCommit();
+        if (c.consumed) revert CommitConsumed();
+        if (c.by != payer) revert BadReveal();
+        c.consumed = true;
+
+        priorityAt[id] = c.at;
+        bytes32 winner = firstCommitFor[contentHash];
+        if (winner == bytes32(0) || c.at < commits[winner].at) firstCommitFor[contentHash] = h;
+
+        emit Revealed(id, h, contentHash, c.at);
+        _record(id, payer, program, amount, contentHash);
+    }
+
     /**
      * Bind an already-received x402 payment to a report.
      *
@@ -229,6 +302,12 @@ contract SubmissionRegistry {
     function record(bytes32 id, address payer, bytes32 program, uint256 amount, bytes32 contentHash)
         external
         onlyOwner
+    {
+        _record(id, payer, program, amount, contentHash);
+    }
+
+    function _record(bytes32 id, address payer, bytes32 program, uint256 amount, bytes32 contentHash)
+        internal
     {
         if (amount == 0) revert ZeroAmount();
         if (submissions[id].payer != address(0)) revert AlreadyExists();

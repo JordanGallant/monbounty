@@ -54,6 +54,41 @@ export function makePayingClient(privateKey: string, opts?: { network?: NetKey; 
   };
 }
 
+/**
+ * A paying client whose EVM signature comes from a Circle developer-controlled
+ * wallet (the key is HSM-held; Circle signs on request). Same x402 flow as the
+ * local-key client, but signTypedData routes to Circle. Circle's API wants the
+ * full EIP-712 structure, so we add the EIP712Domain type viem leaves implicit.
+ */
+export function makeCircleEvmClient(
+  walletId: string, address: string, opts?: { network?: NetKey; maxUsd?: number },
+): PayingClient {
+  const maxUsd = opts?.maxUsd ?? Number(process.env.HUNTER_MAX_USD ?? 25);
+  const preferred = opts?.network ? NETWORKS[opts.network] : ENABLED[0];
+  const EIP712DOMAIN = [
+    { name: "name", type: "string" }, { name: "version", type: "string" },
+    { name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" },
+  ];
+  const signer = {
+    address: address as `0x${string}`,
+    signTypedData: async (m: any) => {
+      const { signTypedData } = await import("../lib/circle");
+      const types = m.types?.EIP712Domain ? m.types : { EIP712Domain: EIP712DOMAIN, ...m.types };
+      return signTypedData(walletId, { domain: m.domain, types, primaryType: m.primaryType, message: m.message });
+    },
+  };
+  const client = x402Client.fromConfig({
+    schemes: ENABLED.map((n) => ({ network: n.id, client: new ExactEvmScheme(signer as any) })),
+    spendControls: {
+      maxAmountPerPayment: `$${maxUsd}`,
+      allowedAssets: ENABLED.map((n) => ({ network: n.id, asset: n.usdc, maxAmountPerPayment: String(maxUsd * 10 ** n.usdcDecimals) })),
+    },
+    paymentRequirementsSelector: (_v: number, accepts: any[]) =>
+      accepts.find((a) => a.network === preferred.id) ?? accepts[0],
+  });
+  return { address: address as `0x${string}`, fetch: wrapFetchWithPayment(fetch, client), preferred };
+}
+
 /** Decode the base64 PAYMENT-REQUIRED header the server sends on a rejected retry. */
 export function readChallenge(res: Response): { reason: string; offers: { amount: string; asset: string; network: string; payTo: string }[] } | null {
   const h = res.headers.get("PAYMENT-REQUIRED") ?? res.headers.get("payment-required");

@@ -133,7 +133,10 @@ export const ready: Promise<void> = (async () => {
   // Postgres does idempotent column adds natively — no table_info probe.
   await db.exec(
     `ALTER TABLE reports ADD COLUMN IF NOT EXISTS payout_usd REAL;
-     ALTER TABLE reports ADD COLUMN IF NOT EXISTS payout_tx TEXT;`,
+     ALTER TABLE reports ADD COLUMN IF NOT EXISTS payout_tx TEXT;
+     ALTER TABLE reports ADD COLUMN IF NOT EXISTS content_swarm_ref  TEXT;
+     ALTER TABLE reports ADD COLUMN IF NOT EXISTS evidence_swarm_ref TEXT;
+     ALTER TABLE reports ADD COLUMN IF NOT EXISTS verdict_swarm_ref  TEXT;`,
   );
 
   // Company waitlist — prospective companies from the landing "Open a bounty" form.
@@ -168,7 +171,113 @@ export const ready: Promise<void> = (async () => {
      ALTER TABLE programs ADD COLUMN IF NOT EXISTS approved_at       TEXT;
      ALTER TABLE programs ADD COLUMN IF NOT EXISTS approved_by       TEXT;
      ALTER TABLE programs ADD COLUMN IF NOT EXISTS verification_mode TEXT NOT NULL DEFAULT 'onchain-fork';
-     ALTER TABLE programs ADD COLUMN IF NOT EXISTS verify_recipe     TEXT;`,
+     ALTER TABLE programs ADD COLUMN IF NOT EXISTS verify_recipe     TEXT;
+     ALTER TABLE programs ADD COLUMN IF NOT EXISTS rules_swarm_ref   TEXT;
+     ALTER TABLE programs ADD COLUMN IF NOT EXISTS ens_name          TEXT;`,
+  );
+
+  // Custodial balance layer: one internal double-entry ledger is the source of
+  // truth for every user/program/platform balance. Amounts are integer USDC base
+  // units (6 decimals) so there is no float drift; a balance is SUM(delta_atomic)
+  // over an account. Fiat (Stripe) and crypto (on-chain/Ramp) are just deposit
+  // rails that credit the same account. All idempotent — safe to run every boot.
+  await db.exec(
+    `CREATE TABLE IF NOT EXISTS ledger_accounts (
+       id         TEXT PRIMARY KEY,
+       ref        TEXT NOT NULL,           -- e.g. user:0xabc, program:my-slug, platform:treasury
+       kind       TEXT NOT NULL,           -- user | program | platform | external
+       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+     );
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_accounts_ref ON ledger_accounts(ref);
+
+     CREATE TABLE IF NOT EXISTS ledger_entries (
+       id           TEXT PRIMARY KEY,
+       tx_id        TEXT NOT NULL,         -- groups the balanced legs of one movement
+       account_id   TEXT NOT NULL REFERENCES ledger_accounts(id),
+       delta_atomic BIGINT NOT NULL,       -- signed; the legs of a tx_id sum to zero
+       memo         TEXT,
+       created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+     );
+     CREATE INDEX IF NOT EXISTS idx_ledger_entries_account ON ledger_entries(account_id);
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_txleg ON ledger_entries(tx_id, account_id);
+
+     -- A top-up in flight. rail: stripe | onchain | ramp. status: open -> credited
+     -- (or expired). provider_ref is the Stripe session id or the on-chain match
+     -- key; unique per rail so a replayed webhook / re-seen transfer is idempotent.
+     CREATE TABLE IF NOT EXISTS deposits (
+       id            TEXT PRIMARY KEY,
+       owner_ref     TEXT NOT NULL,
+       rail          TEXT NOT NULL,
+       amount_atomic BIGINT NOT NULL,
+       status        TEXT NOT NULL DEFAULT 'open',
+       provider_ref  TEXT,
+       tx_id         TEXT,                 -- the ledger tx that credited it, once done
+       chain_tx      TEXT,
+       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+       settled_at    TEXT
+     );
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_deposits_provider ON deposits(rail, provider_ref);
+     CREATE INDEX IF NOT EXISTS idx_deposits_owner ON deposits(owner_ref);
+     CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
+
+     -- The escape hatch back to self-custody: debit balance, treasury pays USDC
+     -- to the user's own address. status: pending -> paid | failed.
+     CREATE TABLE IF NOT EXISTS withdrawals (
+       id            TEXT PRIMARY KEY,
+       owner_ref     TEXT NOT NULL,
+       amount_atomic BIGINT NOT NULL,
+       to_address    TEXT NOT NULL,
+       network       TEXT NOT NULL,
+       status        TEXT NOT NULL DEFAULT 'pending',
+       tx_id         TEXT,
+       chain_tx      TEXT,
+       error         TEXT,
+       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+       paid_at       TEXT
+     );
+     CREATE INDEX IF NOT EXISTS idx_withdrawals_owner ON withdrawals(owner_ref);
+
+     -- Durable identity: an account owns the balance/rewards (owner_ref =
+     -- account:<id>). Rewards survive a lost key because they follow the account,
+     -- not any credential. bound_withdraw_address restricts payouts once set.
+     CREATE TABLE IF NOT EXISTS accounts (
+       id                     TEXT PRIMARY KEY,
+       kind                   TEXT NOT NULL,            -- hunter | company
+       bound_withdraw_address TEXT,
+       status                 TEXT NOT NULL DEFAULT 'active',
+       created_at             TEXT NOT NULL DEFAULT (datetime('now'))
+     );
+
+     -- Bearer credentials, stored ONLY as a SHA-256 hash. type: api_key (runtime,
+     -- many per account, revocable) | recovery (shown once at signup, mints a new
+     -- api_key if all are lost).
+     CREATE TABLE IF NOT EXISTS account_credentials (
+       id           TEXT PRIMARY KEY,
+       account_id   TEXT NOT NULL REFERENCES accounts(id),
+       type         TEXT NOT NULL,
+       token_hash   TEXT NOT NULL,
+       label        TEXT,
+       created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+       last_used_at TEXT,
+       revoked_at   TEXT
+     );
+     CREATE UNIQUE INDEX IF NOT EXISTS idx_cred_hash ON account_credentials(token_hash);
+     CREATE INDEX IF NOT EXISTS idx_cred_account ON account_credentials(account_id, type);`,
+  );
+
+  // Wallet hardening: link a Circle wallet to its owning account, give its
+  // runtime token a spend cap + running total, and make it revocable. All
+  // idempotent so an existing agent_wallets table upgrades in place.
+  await db.exec(
+    `ALTER TABLE agent_wallets ADD COLUMN IF NOT EXISTS account_id    TEXT;
+     ALTER TABLE agent_wallets ADD COLUMN IF NOT EXISTS spend_cap_usd REAL;
+     ALTER TABLE agent_wallets ADD COLUMN IF NOT EXISTS spent_usd     REAL NOT NULL DEFAULT 0;
+     ALTER TABLE agent_wallets ADD COLUMN IF NOT EXISTS revoked_at    TEXT;
+     ALTER TABLE accounts      ADD COLUMN IF NOT EXISTS identity_status TEXT;
+     -- Refund rail: the Stripe payment to refund against, and how much of this
+     -- deposit has already been refunded (partials allowed).
+     ALTER TABLE deposits ADD COLUMN IF NOT EXISTS stripe_payment_intent TEXT;
+     ALTER TABLE deposits ADD COLUMN IF NOT EXISTS refunded_atomic BIGINT NOT NULL DEFAULT 0;`,
   );
 
   // Seed a couple of Monad-flavoured programs so the demo has something to hit.
@@ -235,6 +344,10 @@ export interface ProgramRow {
   approved_by: string | null;
   verification_mode: "onchain-fork" | "company-attested";
   verify_recipe: string | null;
+  // Swarm/ENS: the canonical rules are also stored on Swarm (censorship-resistant)
+  // and can be pointed at by an ENS name's contenthash.
+  rules_swarm_ref: string | null;
+  ens_name: string | null;
 }
 
 export interface ReportRow {
@@ -257,6 +370,9 @@ export interface ReportRow {
   poc_at: string | null;
   status: ReportStatus;
   verdict_note: string | null;
+  content_swarm_ref: string | null;
+  evidence_swarm_ref: string | null;
+  verdict_swarm_ref: string | null;
   triaged_at: string | null;
   refund_tx: string | null;
   payout_usd: number | null;
@@ -302,6 +418,10 @@ export interface AgentWalletRow {
   label: string | null;
   created_at: string;
   last_used_at: string | null;
+  account_id: string | null;
+  spend_cap_usd: number | null;
+  spent_usd: number;
+  revoked_at: string | null;
 }
 
 /**
@@ -313,10 +433,24 @@ export async function walletByToken(id: string, tokenHash: string): Promise<Agen
   return (
     (await db
       .query<AgentWalletRow, [string, string]>(
-        "SELECT * FROM agent_wallets WHERE id = ? AND token_hash = ?",
+        "SELECT * FROM agent_wallets WHERE id = ? AND token_hash = ? AND revoked_at IS NULL",
       )
       .get(id, tokenHash)) ?? null
   );
+}
+
+/** A wallet by id (any state) — for the account-authed rotate/payout endpoints. */
+export async function getAgentWallet(id: string): Promise<AgentWalletRow | null> {
+  await ready;
+  return (await db.query<AgentWalletRow, [string]>("SELECT * FROM agent_wallets WHERE id = ?").get(id)) ?? null;
+}
+export async function revokeAgentWallet(id: string): Promise<void> {
+  await ready;
+  await db.run("UPDATE agent_wallets SET revoked_at = datetime('now') WHERE id = ?", [id]);
+}
+export async function addWalletSpend(id: string, usd: number): Promise<void> {
+  await ready;
+  await db.run("UPDATE agent_wallets SET spent_usd = spent_usd + ?, last_used_at = datetime('now') WHERE id = ?", [usd, id]);
 }
 
 export async function getProgram(slug: string): Promise<ProgramRow | null> {
@@ -352,7 +486,9 @@ export async function findDuplicate(program: string, contentHash: string): Promi
 
 // ── company side ────────────────────────────────────────────────────────────
 import type { BountyRules } from "./rules";
-import { rulesHash } from "./rules";
+import { rulesHash, canonicalRules } from "./rules";
+import { swarmUpload, SWARM_ENABLED } from "./swarm";
+import { programEnsName } from "./ens";
 
 /** Any program by slug, including inactive — for the company/rules views. */
 export async function getProgramRow(slug: string): Promise<ProgramRow | null> {
@@ -372,7 +508,7 @@ export async function createBountyProgram(
   rules: BountyRules,
   extras: { bondUsd: number; tvlUsd?: number | null; contact?: string | null; createdBy?: string | null;
             verificationMode?: string; verifyRecipe?: unknown },
-): Promise<{ slug: string; rulesHash: string }> {
+): Promise<{ slug: string; rulesHash: string; swarmRef: string | null; ensName: string }> {
   await ready;
   const slug = rules.slug.trim().toLowerCase();
   const hash = rulesHash(rules);
@@ -397,7 +533,36 @@ export async function createBountyProgram(
       extras.verifyRecipe ? JSON.stringify(extras.verifyRecipe) : null,
     ],
   );
-  return { slug, rulesHash: hash };
+
+  // Publish the canonical rules to Swarm so they are censorship-resistant and
+  // retrievable by anyone: keccak256(bytes on Swarm) == the rules_hash we just
+  // committed. Non-fatal — a program is still valid if Swarm is briefly down;
+  // scripts/swarm-backfill.ts can push it later.
+  let swarmRef: string | null = null;
+  const ensName = programEnsName(slug);
+  if (SWARM_ENABLED) {
+    try {
+      const up = await swarmUpload(canonicalRules(rules), {
+        filename: `${slug}.rules.json`, contentType: "application/json",
+      });
+      swarmRef = up.reference;
+      await db.run("UPDATE programs SET rules_swarm_ref = ?, ens_name = ? WHERE slug = ?",
+        [swarmRef, ensName, slug]);
+    } catch (e) {
+      console.warn(`[swarm] rules upload failed for ${slug}:`, String(e).slice(0, 160));
+      await db.run("UPDATE programs SET ens_name = ? WHERE slug = ?", [ensName, slug]);
+    }
+  }
+  return { slug, rulesHash: hash, swarmRef, ensName };
+}
+
+/** Record a Swarm reference for a report artifact (content / evidence / verdict). */
+export async function setReportSwarm(
+  id: string, field: "content" | "evidence" | "verdict", reference: string,
+): Promise<void> {
+  await ready;
+  const col = { content: "content_swarm_ref", evidence: "evidence_swarm_ref", verdict: "verdict_swarm_ref" }[field];
+  await db.run(`UPDATE reports SET ${col} = ? WHERE id = ?`, [reference, id]);
 }
 
 /** Record reward-pool funding for a bounty (fiat or USDC). */
@@ -439,4 +604,116 @@ export async function setProgramRecipe(
   await db.run("UPDATE programs SET verification_mode = ?, verify_recipe = ? WHERE slug = ?",
     [verificationMode, verifyRecipe ? JSON.stringify(verifyRecipe) : null, slug]);
   return true;
+}
+
+/** Record where a program's canonical rules live on Swarm + its ENS name. */
+export async function setProgramSwarm(
+  slug: string, rulesSwarmRef: string | null, ensName?: string | null,
+): Promise<boolean> {
+  await ready;
+  const row = await getProgramRow(slug);
+  if (!row) return false;
+  if (ensName === undefined) {
+    await db.run("UPDATE programs SET rules_swarm_ref = ? WHERE slug = ?", [rulesSwarmRef, slug]);
+  } else {
+    await db.run("UPDATE programs SET rules_swarm_ref = ?, ens_name = ? WHERE slug = ?",
+      [rulesSwarmRef, ensName, slug]);
+  }
+  return true;
+}
+
+
+// ── custodial balance: deposits & withdrawals ────────────────────────────────
+
+export interface DepositRow {
+  id: string; owner_ref: string; rail: string; amount_atomic: string;
+  status: string; provider_ref: string | null; tx_id: string | null;
+  chain_tx: string | null; created_at: string; settled_at: string | null;
+  stripe_payment_intent: string | null; refunded_atomic: string;
+}
+export interface WithdrawalRow {
+  id: string; owner_ref: string; amount_atomic: string; to_address: string;
+  network: string; status: string; tx_id: string | null; chain_tx: string | null;
+  error: string | null; created_at: string; paid_at: string | null;
+}
+
+export async function createDeposit(
+  id: string, ownerRef: string, rail: "stripe" | "onchain" | "ramp",
+  amountAtomic: bigint, providerRef: string,
+): Promise<void> {
+  await ready;
+  await db.run(
+    `INSERT INTO deposits (id, owner_ref, rail, amount_atomic, status, provider_ref)
+     VALUES (?,?,?,?,'open',?)`,
+    [id, ownerRef, rail, amountAtomic.toString(), providerRef],
+  );
+}
+
+export async function getDeposit(id: string): Promise<DepositRow | null> {
+  await ready;
+  return (await db.query<DepositRow, [string]>("SELECT * FROM deposits WHERE id = ?").get(id)) ?? null;
+}
+export async function getDepositByProvider(rail: string, providerRef: string): Promise<DepositRow | null> {
+  await ready;
+  return (await db.query<DepositRow, [string, string]>(
+    "SELECT * FROM deposits WHERE rail = ? AND provider_ref = ?").get(rail, providerRef)) ?? null;
+}
+export async function listOpenDeposits(rail: string): Promise<DepositRow[]> {
+  await ready;
+  return db.query<DepositRow, [string]>(
+    "SELECT * FROM deposits WHERE rail = ? AND status = 'open' ORDER BY created_at").all(rail);
+}
+export async function markDepositCredited(id: string, txId: string, chainTx: string | null): Promise<void> {
+  await ready;
+  await db.run(
+    "UPDATE deposits SET status = 'credited', tx_id = ?, chain_tx = ?, settled_at = datetime('now') WHERE id = ?",
+    [txId, chainTx, id]);
+}
+export async function setDepositPaymentIntent(id: string, paymentIntent: string): Promise<void> {
+  await ready;
+  await db.run("UPDATE deposits SET stripe_payment_intent = ? WHERE id = ?", [paymentIntent, id]);
+}
+
+/** Credited Stripe deposits for an owner that still have refundable headroom, oldest first. */
+export async function listRefundableStripeDeposits(ownerRef: string): Promise<DepositRow[]> {
+  await ready;
+  return db.query<DepositRow, [string]>(
+    `SELECT * FROM deposits
+       WHERE owner_ref = ? AND rail = 'stripe' AND status = 'credited'
+         AND stripe_payment_intent IS NOT NULL
+         AND refunded_atomic < amount_atomic
+       ORDER BY created_at`,
+  ).all(ownerRef);
+}
+export async function addDepositRefunded(id: string, addAtomic: bigint): Promise<void> {
+  await ready;
+  await db.run("UPDATE deposits SET refunded_atomic = refunded_atomic + ? WHERE id = ?", [addAtomic.toString(), id]);
+}
+
+export async function createWithdrawal(
+  id: string, ownerRef: string, amountAtomic: bigint, toAddress: string, network: string,
+): Promise<void> {
+  await ready;
+  await db.run(
+    `INSERT INTO withdrawals (id, owner_ref, amount_atomic, to_address, network, status)
+     VALUES (?,?,?,?,?,'pending')`,
+    [id, ownerRef, amountAtomic.toString(), toAddress, network]);
+}
+export async function markWithdrawal(
+  id: string, status: "paid" | "failed", fields: { txId?: string; chainTx?: string; error?: string },
+): Promise<void> {
+  await ready;
+  await db.run(
+    "UPDATE withdrawals SET status = ?, tx_id = ?, chain_tx = ?, error = ?, paid_at = datetime('now') WHERE id = ?",
+    [status, fields.txId ?? null, fields.chainTx ?? null, fields.error ?? null, id]);
+}
+export async function listWithdrawals(ownerRef: string, limit = 25): Promise<WithdrawalRow[]> {
+  await ready;
+  return db.query<WithdrawalRow, [string, number]>(
+    "SELECT * FROM withdrawals WHERE owner_ref = ? ORDER BY created_at DESC LIMIT ?").all(ownerRef, limit);
+}
+export async function listDeposits(ownerRef: string, limit = 25): Promise<DepositRow[]> {
+  await ready;
+  return db.query<DepositRow, [string, number]>(
+    "SELECT * FROM deposits WHERE owner_ref = ? ORDER BY created_at DESC LIMIT ?").all(ownerRef, limit);
 }

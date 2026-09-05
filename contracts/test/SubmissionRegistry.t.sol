@@ -156,6 +156,92 @@ contract SubmissionRegistryTest is Test {
         reg.createBounty(BOUNTY, ruler, keccak256("rules-v2"), _tiers(), 1 days);
     }
 
+    // --- commit-reveal (#3) ------------------------------------------------
+
+    address hunterB = address(0xB0B);
+    bytes32 constant CONTENT = keccak256("idor-on-users-endpoint");
+    bytes32 constant SALT_A  = keccak256("salt-a");
+    bytes32 constant SALT_B  = keccak256("salt-b");
+
+    function test_CommitRevealStampsPriority() public {
+        bytes32 h = reg.commitHashFor(hunter, BOUNTY, CONTENT, SALT_A);
+        vm.prank(hunter);
+        reg.commit(h);
+        uint64 committedAt = uint64(block.timestamp);
+
+        vm.warp(block.timestamp + 42);           // bond lands later than the claim
+        usdc.mint(address(reg), 10 * M);
+        reg.recordRevealed(SUB, hunter, BOUNTY, 10 * M, CONTENT, SALT_A);
+
+        assertEq(reg.priorityAt(SUB), committedAt, "priority is the commit time, not the reveal time");
+        assertEq(reg.firstCommitFor(CONTENT), h, "earliest (only) commit owns the content");
+        (address payer,,,,,,,,,) = _sub(SUB);
+        assertEq(payer, hunter, "reveal still records the bond like record()");
+    }
+
+    function test_RevealRequiresAMatchingCommit() public {
+        usdc.mint(address(reg), 10 * M);
+        // No commit at all.
+        vm.expectRevert(SubmissionRegistry.UnknownCommit.selector);
+        reg.recordRevealed(SUB, hunter, BOUNTY, 10 * M, CONTENT, SALT_A);
+
+        // Commit one salt, reveal another -> hash won't resolve to a known commit.
+        vm.prank(hunter);
+        reg.commit(reg.commitHashFor(hunter, BOUNTY, CONTENT, SALT_A));
+        vm.expectRevert(SubmissionRegistry.UnknownCommit.selector);
+        reg.recordRevealed(SUB, hunter, BOUNTY, 10 * M, CONTENT, SALT_B);
+    }
+
+    function test_CommitCannotBeDuplicated() public {
+        bytes32 h = reg.commitHashFor(hunter, BOUNTY, CONTENT, SALT_A);
+        vm.prank(hunter);
+        reg.commit(h);
+        vm.prank(hunter);
+        vm.expectRevert(SubmissionRegistry.CommitExists.selector);
+        reg.commit(h);
+    }
+
+    function test_CommitCannotBeRevealedTwice() public {
+        bytes32 h = reg.commitHashFor(hunter, BOUNTY, CONTENT, SALT_A);
+        vm.prank(hunter);
+        reg.commit(h);
+        usdc.mint(address(reg), 10 * M);
+        reg.recordRevealed(SUB, hunter, BOUNTY, 10 * M, CONTENT, SALT_A);
+
+        usdc.mint(address(reg), 10 * M);
+        vm.expectRevert(SubmissionRegistry.CommitConsumed.selector);
+        reg.recordRevealed(keccak256("sub-again"), hunter, BOUNTY, 10 * M, CONTENT, SALT_A);
+    }
+
+    /// The point of #3: whoever committed first provably owns the finding, even
+    /// though both hunters reveal the identical content hash.
+    function test_EarlierCommitWinsTheDuplicate() public {
+        bytes32 hA = reg.commitHashFor(hunter,  BOUNTY, CONTENT, SALT_A);
+        bytes32 hB = reg.commitHashFor(hunterB, BOUNTY, CONTENT, SALT_B);
+
+        vm.prank(hunter);
+        reg.commit(hA);                          // A first
+        uint64 tA = uint64(block.timestamp);
+        vm.warp(block.timestamp + 100);
+        vm.prank(hunterB);
+        reg.commit(hB);                          // B a block later, same bug
+
+        // Reveal + settle A so its worst-case reservation frees up for B. Grade
+        // is irrelevant to the priority claim, so slop it (award 0, pool intact).
+        usdc.mint(address(reg), 10 * M);
+        reg.recordRevealed(SUB, hunter, BOUNTY, 10 * M, CONTENT, SALT_A);
+        vm.prank(ruler);
+        reg.grade(SUB, SubmissionRegistry.Verdict.Slop, 4);
+        reg.settle(SUB);
+
+        usdc.mint(address(reg), 10 * M);
+        reg.recordRevealed(keccak256("sub-b"), hunterB, BOUNTY, 10 * M, CONTENT, SALT_B);
+
+        assertEq(reg.firstCommitFor(CONTENT), hA, "the earlier commit owns the content");
+        assertEq(reg.priorityAt(SUB), tA, "A keeps its early priority stamp");
+        assertLt(reg.priorityAt(SUB), reg.priorityAt(keccak256("sub-b")), "A is provably ahead of B");
+    }
+
     function _sub(bytes32 id) internal view
         returns (address, uint256, bytes32, bytes32, uint64, SubmissionRegistry.Verdict, bool, uint8, uint256, bool)
     { return reg.submissions(id); }

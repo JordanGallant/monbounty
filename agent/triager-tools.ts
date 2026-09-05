@@ -33,7 +33,9 @@ function netKeyOf(networkId: string): NetKey {
 export async function list_pending_reports(ctx: TriagerContext) {
   const data = await j(await fetch(`${ctx.baseUrl}/api/admin/reports?status=triaging`, { headers: auth(ctx) }));
   return {
-    reports: (data.reports ?? []).map((r: any) => ({
+    // The EVM triager settles on Monad; Solana-bonded reports are settled by the
+    // Solana path (demo/hunter/solana-settle.ts), so they're excluded here.
+    reports: (data.reports ?? []).filter((r: any) => r.network !== "solana-devnet").map((r: any) => ({
       id: r.id,
       program: r.program,
       hunter: r.payer,

@@ -23,3 +23,11 @@ data/*.sqlite-*
 *.bak
 *.log
 cache/
+demo/hunter/.secrets/
+
+# secrets & local-only artifacts — NEVER commit
+*.dat
+recovery_file_*.dat
+circle-entity-secret-recovery.dat
+static/
+.config/

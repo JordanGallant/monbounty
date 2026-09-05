@@ -3,13 +3,27 @@ import { paymentMiddleware } from "@x402/hono";
 import { x402ResourceServer, HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 
-import { NET, ENABLED, netById, payToFor, rampUrl, FACILITATOR_URL, PORT, PUBLIC_URL, ADMIN_TOKEN, DEFAULT_BOND_USD, POC_MULTIPLIER, ERC8004_REQUIRED, usdPrice, assertConfig, type MonadNet } from "./lib/config";
-import { db, getProgram, listPrograms, findDuplicate, walletByToken, getProgramRow, createBountyProgram, recordProgramFunding, listAllPrograms, setProgramApproval, setProgramRecipe, type ReportRow, type ReportStatus, type FundingRequestRow, type AgentWalletRow, type ApprovalRow, type ProgramRow } from "./lib/db";
+import { NET, ENABLED, netById, payToFor, rampUrl, offrampUrl, FACILITATOR_URL, PORT, PUBLIC_URL, ADMIN_TOKEN, DEFAULT_BOND_USD, POC_MULTIPLIER, ERC8004_REQUIRED, usdPrice, assertConfig, CUSTODY_ENABLED, stripeConfigured, stripeWebhookReady, STRIPE_PUBLISHABLE_KEY, PLATFORM_DEPOSIT_ADDRESS, type MonadNet } from "./lib/config";
+import { db, getProgram, listPrograms, findDuplicate, walletByToken, getProgramRow, createBountyProgram, recordProgramFunding, listAllPrograms, setProgramApproval, setProgramRecipe, createDeposit, getDeposit, getDepositByProvider, markDepositCredited, createWithdrawal, markWithdrawal, listWithdrawals, listDeposits, type ReportRow, type ReportStatus, type FundingRequestRow, type AgentWalletRow, type ApprovalRow, type ProgramRow } from "./lib/db";
+import { toAtomic, fromAtomic, balanceAtomic, balanceUsd, history as ledgerHistory, creditDeposit, moveUserToProgram, debitWithdrawal, integrity, userRef, externalRef, post as ledgerPost } from "./lib/ledger";
+import { createCheckoutSession, verifyWebhook, createRefund } from "./lib/stripe";
+import { setDepositPaymentIntent, listRefundableStripeDeposits, addDepositRefunded } from "./lib/db";
+import { fiatToUsdc } from "./lib/conversion";
+import { startDepositWatcher } from "./lib/deposit-watch";
+import { treasuryFromEnv } from "./agent/treasury";
+import { createAccount, getAccount, issueCredential, resolveApiKey, verifyRecovery, revokeApiKeys, rotateRecovery, setBoundWithdrawAddress, accountRef, type AccountKind } from "./lib/accounts";
+import { getAgentWallet, addWalletSpend } from "./lib/db";
+import { assertBondAuthorization } from "./lib/x402-guard";
 import { canonicalRules, rulesHash, bountyOnchainParams, validateRules, type BountyRules } from "./lib/rules";
+import { swarmUpload, swarmVerify, bzzUrl, bzzUri, SWARM_ENABLED, SWARM_GATEWAY } from "./lib/swarm";
+import { encodeSwarmContenthash, setContenthashPlan, readEnsSwarm, programEnsName, isPlainSwarmRef, MONBOUNTY_ENS_PARENT } from "./lib/ens";
+import { setProgramSwarm, setReportSwarm } from "./lib/db";
+import { initSvm, svmPrice, SOLANA_DEVNET_CAIP2 } from "./lib/x402-svm";
+import { isSolanaAddress, solExplorer, SOLANA_USDC } from "./lib/solana";
 import { SEVERITIES, IMPACT_BY_ID, IMPACTS, machineCheckable, validatePayouts, PRESET_PAYOUTS, criticalFromTvl, type PayoutTable } from "./lib/severity";
 import { decodePaymentHeader, contentHash } from "./lib/payment";
 import { reputationFor, leaderboard, touchHunter, assessHunter } from "./lib/reputation";
-import { circleConfigured, createWallet, signTypedData } from "./lib/circle";
+import { circleConfigured, createWallet, createSolanaWallet as circleCreateSolanaWallet, signTypedData } from "./lib/circle";
 import { balancesFor } from "./lib/balance";
 
 assertConfig();
@@ -21,10 +35,15 @@ const app = new Hono();
 
 // ── x402 resource server ────────────────────────────────────────────────────
 const facilitator = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
-const resourceServer = new x402ResourceServer(facilitator);
+// Solana devnet x402: an in-process facilitator (lib/x402-svm.ts). Null when
+// SOLANA_ENABLED != 1 or init fails — the EVM flow is never affected.
+const svm = await initSvm();
+const SOLANA_PAY_TO = process.env.SOLANA_PAY_TO ?? svm?.feePayer ?? "";
+const resourceServer = new x402ResourceServer(svm ? [facilitator, svm.facilitator] : facilitator);
 // One scheme instance per network. The client decides which of the advertised
-// `accepts` entries to pay, so mainnet and testnet coexist on the same route.
+// `accepts` entries to pay, so mainnet, testnet and Solana coexist on one route.
 for (const net of ENABLED) resourceServer.register(net.id, new ExactEvmScheme());
+if (svm) resourceServer.register(SOLANA_DEVNET_CAIP2, svm.serverScheme);
 
 // The afterSettle hook fires once the facilitator has landed the transfer,
 // which is after our handler has already written the row. Correlate on the
@@ -63,21 +82,21 @@ const bondFor = async (baseUsd: number, ctx: any) => {
   return Math.max(baseUsd * mult, 0.01);
 };
 
-/** Bond for step 1, from the program named in ?program=, priced on `net`. */
-const submitPrice = (net: MonadNet) => async (ctx: any) => {
+/** Bond for step 1 in USD, from the program named in ?program=. */
+const submitBondUsd = async (ctx: any): Promise<number> => {
   const slug = String(ctx?.adapter?.getQueryParam?.("program") ?? "");
   const program = slug ? await getProgram(slug) : null;
-  return usdPrice(await bondFor(program?.bond_usd ?? DEFAULT_BOND_USD, ctx), net);
+  return bondFor(program?.bond_usd ?? DEFAULT_BOND_USD, ctx);
 };
 
-/** Step 2 costs a multiple of the bond — this is the gate bots die on. */
-const pocPrice = (net: MonadNet) => async (ctx: any) => {
+/** Step 2 bond in USD — a multiple of step 1. This is the gate bots die on. */
+const pocBondUsd = async (ctx: any): Promise<number> => {
   const id = String(ctx?.path ?? "").split("/").at(-2) ?? "";
   const row = await db
     .query<{ bond_usd: number }, [string]>("SELECT bond_usd FROM reports WHERE id = ?")
     .get(id);
   const base = row?.bond_usd ?? DEFAULT_BOND_USD;
-  return usdPrice(await bondFor(base * POC_MULTIPLIER, ctx), net);
+  return bondFor(base * POC_MULTIPLIER, ctx);
 };
 
 /** One accepts entry per enabled network — the payer chooses the chain. */
@@ -95,22 +114,38 @@ const pocPayTo = (net: MonadNet) => async (ctx: any) => {
   return companyReceiver(row ? await getProgram(row.program) : null, net);
 };
 
+/**
+ * Build the x402 `accepts` list for a route: one EVM entry per enabled Monad
+ * network, plus a Solana devnet entry when the SVM rail is up. The same USD bond
+ * is quoted on every chain — the payer picks which one to settle on. EVM prices
+ * wrap the USD in EIP-3009 USDC; Solana wraps it in the SPL USDC mint amount.
+ */
 const acceptsFor = (
-  price: (n: MonadNet) => (ctx: any) => unknown | Promise<unknown>,
-  payTo: (n: MonadNet) => (ctx: any) => string | Promise<string>,
-) =>
-  ENABLED.map((net) => ({
+  bondUsd: (ctx: any) => Promise<number>,
+  evmPayTo: (n: MonadNet) => (ctx: any) => string | Promise<string>,
+) => {
+  const entries: any[] = ENABLED.map((net) => ({
     scheme: "exact" as const,
     network: net.id,
-    payTo: payTo(net),
-    price: price(net),
+    payTo: evmPayTo(net),
+    price: async (ctx: any) => usdPrice(await bondUsd(ctx), net),
   }));
+  if (svm && SOLANA_PAY_TO) {
+    entries.push({
+      scheme: "exact" as const,
+      network: SOLANA_DEVNET_CAIP2,
+      payTo: SOLANA_PAY_TO,
+      price: async (ctx: any) => svmPrice(await bondUsd(ctx)),
+    });
+  }
+  return entries;
+};
 
 app.use(
   paymentMiddleware(
     {
       "POST /api/v1/reports": {
-        accepts: acceptsFor(submitPrice, submitPayTo),
+        accepts: acceptsFor(submitBondUsd, submitPayTo),
         resource: `${PUBLIC_URL}/api/v1/reports`,
         description: "Submit a vulnerability report. Refundable bond, slashed for slop.",
         serviceName: "bounty402",
@@ -136,7 +171,7 @@ app.use(
         }),
       },
       "POST /api/v1/reports/:id/poc": {
-        accepts: acceptsFor(pocPrice, pocPayTo),
+        accepts: acceptsFor(pocBondUsd, pocPayTo),
         resource: `${PUBLIC_URL}/api/v1/reports`,
         description: "Attach a proof of concept to a report. Second gate, higher bond.",
         serviceName: "bounty402",
@@ -158,10 +193,174 @@ app.use(
   ),
 );
 
+/**
+ * Create a fresh EVM hunter wallet. Default: a Circle developer-controlled
+ * wallet — the key is HSM-held, the agent never touches a private key and signs
+ * x402 bonds through Circle. Pass ?custody=local to get a self-custody keypair
+ * (fallback when Circle is unconfigured).
+ */
+app.post("/api/wallet", async (c) => {
+  const local = c.req.query("custody") === "local";
+  if (!local && circleConfigured()) {
+    try {
+      const w = await createWallet(NET);
+      return c.json({
+        address: w.address, walletId: w.walletId, custody: "circle", chain: w.chain,
+        networks: ENABLED.map((n) => ({ id: n.id, name: n.name, usdc: n.usdc, testnet: n.testnet })),
+        identity: { scheme: "evm-address", id: w.address,
+          note: "Circle developer-controlled wallet — the private key is HSM-held; you sign x402 bonds via Circle and never manage a key." },
+        fund: { usdc: `Deposit USDC to ${w.address} on ${ENABLED.map((n) => n.name).join(" or ")}.` },
+        statusUrl: `${PUBLIC_URL}/api/hunters/${w.address}/status`,
+      });
+    } catch (e) {
+      console.warn("[circle] EVM wallet create failed, falling back to local:", String(e).slice(0, 160));
+    }
+  }
+  const { generatePrivateKey, privateKeyToAccount } = await import("viem/accounts");
+  const privateKey = generatePrivateKey();
+  const address = privateKeyToAccount(privateKey).address;
+  return c.json({
+    address, privateKey, custody: "local",
+    networks: ENABLED.map((n) => ({ id: n.id, name: n.name, usdc: n.usdc, testnet: n.testnet })),
+    identity: { scheme: "evm-address", id: address,
+      note: "Self-custody keypair — fund with USDC only; the facilitator pays gas." },
+    fund: { usdc: `Deposit USDC to ${address} on ${ENABLED.map((n) => n.name).join(" or ")}.` },
+    statusUrl: `${PUBLIC_URL}/api/hunters/${address}/status`,
+    keep: "Store privateKey securely. monbounty does not keep it.",
+  });
+});
+
+// ── Solana devnet rail: wallet creation, identity, balances ──────────────────
+// Parity with the EVM side. A hunter or company provisions a Solana wallet, is
+// identified by its pubkey, and funds it with devnet USDC to pay bonds over the
+// Solana x402 gate (advertised in the 402 challenge alongside Monad).
+
+/**
+ * Create a fresh Solana wallet. Default: a Circle developer-controlled wallet
+ * (HSM-held key, agent never manages it). Pass ?custody=local for a self-custody
+ * keypair (fallback when Circle is unconfigured).
+ */
+app.post("/api/solana/wallet", async (c) => {
+  if (!svm) return c.json({ error: "solana_disabled" }, 404);
+  const local = c.req.query("custody") === "local";
+  if (!local && circleConfigured()) {
+    try {
+      const w = await circleCreateSolanaWallet(true);
+      return c.json({
+        address: w.address, walletId: w.walletId, custody: "circle", network: SOLANA_DEVNET_CAIP2,
+        identity: { scheme: "solana-pubkey", id: w.address,
+          note: "Circle developer-controlled Solana wallet — the key is HSM-held; the agent signs via Circle and never manages a key." },
+        fund: { usdc: `Devnet USDC (${SOLANA_USDC}) via https://faucet.circle.com` },
+        explorer: solExplorer("address", w.address),
+      });
+    } catch (e) {
+      console.warn("[circle] Solana wallet create failed, falling back to local:", String(e).slice(0, 160));
+    }
+  }
+  const { createSolanaWallet } = await import("./lib/solana");
+  const w = createSolanaWallet();
+  return c.json({
+    address: w.address,
+    secretKeyBase58: w.secretKeyBase58,
+    custody: "local",
+    network: SOLANA_DEVNET_CAIP2,
+    identity: { scheme: "solana-pubkey", id: w.address,
+      note: "Self-custody keypair — your pubkey IS your identity, no registry needed." },
+    fund: {
+      sol: "Devnet SOL for tx fees: https://faucet.solana.com (paste the address)",
+      usdc: `Devnet USDC (${(await import("./lib/solana")).SOLANA_USDC}) via https://faucet.circle.com`,
+    },
+    explorer: solExplorer("address", w.address),
+    keep: "Store secretKeyBase58 securely. monbounty does not keep it.",
+  });
+});
+
+/** Wallet + identity status for a Solana address — mirrors the EVM hunter status. */
+app.get("/api/solana/:address/status", async (c) => {
+  if (!svm) return c.json({ error: "solana_disabled" }, 404);
+  const address = c.req.param("address");
+  if (!isSolanaAddress(address)) return c.json({ error: "bad_address" }, 422);
+  const { solanaBalances, SOLANA_USDC } = await import("./lib/solana");
+  const bal = await solanaBalances(address);
+  const nextAction = bal.needsGas
+    ? "Fund with devnet SOL (tx fees) at https://faucet.solana.com, then devnet USDC at https://faucet.circle.com."
+    : !bal.funded
+      ? `Fund with devnet USDC (${SOLANA_USDC}) at https://faucet.circle.com to pay a bond.`
+      : "Funded. Submit a report — the x402 challenge offers a Solana devnet payment option.";
+  return c.json({
+    address, network: SOLANA_DEVNET_CAIP2,
+    identity: { scheme: "solana-pubkey", id: address },
+    balances: { sol: bal.sol, usdc: bal.usdc },
+    ready: bal.funded, needsGas: bal.needsGas,
+    payment: { asset: SOLANA_USDC, payTo: SOLANA_PAY_TO, feePayer: svm.feePayer },
+    nextAction, explorer: solExplorer("address", address),
+  });
+});
+
+// ── web3 intake: submit a contract address (verify it's deployed) or an ABI ──
+// A company opening an on-chain bounty submits either a deployed contract
+// address — which we verify actually has bytecode on the target chain — or a
+// raw ABI. The verified target then scopes an onchain-fork PoC bounty
+// (contracts/poc/ImpactProof harness proves the impact band).
+app.post("/api/web3/verify-contract", async (c) => {
+  const body = await c.req.json().catch(() => ({} as any));
+  const address = String(body.address ?? "").trim();
+  const rpcUrl = String(body.rpc ?? process.env.WEB3_DEMO_RPC ?? "http://127.0.0.1:8545");
+  const abi = body.abi ?? null;
+
+  // ABI-only submission: accept it, no chain lookup needed.
+  if (!address && abi) {
+    return c.json({ mode: "abi", accepted: true,
+      functions: Array.isArray(abi) ? abi.filter((x: any) => x?.type === "function").map((x: any) => x.name) : null });
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return c.json({ error: "bad_address" }, 422);
+
+  try {
+    const { createPublicClient, http } = await import("viem");
+    const client = createPublicClient({ transport: http(rpcUrl) });
+    const [code, chainId] = await Promise.all([
+      client.getBytecode({ address: address as `0x${string}` }),
+      client.getChainId().catch(() => null),
+    ]);
+    const deployed = Boolean(code && code !== "0x");
+    return c.json({
+      mode: "address", address, rpc: rpcUrl, chainId,
+      deployed, codeSizeBytes: deployed ? (code!.length - 2) / 2 : 0,
+      abi: abi ?? undefined,
+      verdict: deployed
+        ? "Contract is deployed — eligible to scope an onchain-fork bounty."
+        : "No bytecode at this address on the given RPC (not deployed / wrong chain).",
+    });
+  } catch (e) {
+    return c.json({ error: "rpc_error", detail: String(e).slice(0, 160), rpc: rpcUrl }, 502);
+  }
+});
+
 // ── public read API ─────────────────────────────────────────────────────────
 app.get("/healthz", (c) =>
   c.json({ ok: true, networks: ENABLED.map((n) => n.id), facilitator: FACILITATOR_URL }),
 );
+
+/**
+ * The Swarm + ENS storage anchors for a program, for API responses. `swarm` is
+ * where the canonical rules live (content-addressed, censorship-resistant);
+ * `ens` is the human-readable name whose contenthash points at that Swarm ref.
+ */
+function storageBlock(p: ProgramRow) {
+  const ref = p.rules_swarm_ref;
+  const name = p.ens_name ?? programEnsName(p.slug);
+  return {
+    swarm: ref
+      ? { reference: ref, uri: bzzUri(ref), url: bzzUrl(ref), gateway: SWARM_GATEWAY }
+      : null,
+    ens: {
+      name,
+      // The contenthash a name owner sets so `name.eth` resolves to the rules.
+      contenthash: ref && isPlainSwarmRef(ref) ? encodeSwarmContenthash(ref) : null,
+      dweb: `https://${name}.limo`,
+    },
+  };
+}
 
 app.get("/api/programs", async (c) =>
   c.json({
@@ -177,6 +376,11 @@ app.get("/api/programs", async (c) =>
     })),
     defaultNetwork: NET.id,
     facilitator: FACILITATOR_URL,
+    solana: svm
+      ? { network: SOLANA_DEVNET_CAIP2, usdc: process.env.SOLANA_USDC ?? "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+          payTo: SOLANA_PAY_TO, feePayer: svm.feePayer, facilitator: "in-process",
+          createWallet: `${PUBLIC_URL}/api/solana/wallet` }
+      : null,
     programs: (await listPrograms()).map((p) => {
       const safeJson = (t: string | null, d: any) => { try { return t ? JSON.parse(t) : d; } catch { return d; } };
       const committed = Boolean(p.rules_hash);
@@ -201,6 +405,7 @@ app.get("/api/programs", async (c) =>
         pool: committed
           ? { committedUsd: p.pool_committed_usd, fundedUsd: p.pool_funded_usd, solvent: p.pool_funded_usd >= p.pool_committed_usd }
           : null,
+        storage: storageBlock(p),
       };
     }),
   }),
@@ -310,6 +515,45 @@ app.put("/api/programs/:slug/recipe", async (c) => {
       bootSec: b.bootSec != null ? Number(b.bootSec) : undefined,
       assertions: typeof b.assertions === "object" && b.assertions ? b.assertions : {},
     };
+    // Deployment profile (optional): names the production surface so verdicts
+    // can flag when the sandbox can't reproduce it (e.g. Vercel). Normalised so
+    // an unknown platform string doesn't leak straight through.
+    if (b.deployment && typeof b.deployment === "object") {
+      const { normalizePlatform } = await import("./lib/deployment-context");
+      const d = b.deployment;
+      recipe.deployment = {
+        platform: normalizePlatform(d.platform),
+        framework: d.framework ? String(d.framework) : undefined,
+        frameworkVersion: d.frameworkVersion ? String(d.frameworkVersion) : undefined,
+        runtime: d.runtime ? String(d.runtime) : undefined,
+        waf: typeof d.waf === "boolean" ? d.waf : undefined,
+        notes: d.notes ? String(d.notes) : undefined,
+      };
+    }
+  } else if (b?.web3 && typeof b.web3 === "object") {
+    // onchain-fork mode: capture the web3 target (chain / VM / how the source is
+    // provided) so the fork-and-PoC harness knows what to reproduce, and the
+    // committed scope reflects the VM. Normalised via lib/chain-context.
+    const { normalizeEcosystem, ecosystemFromLang } = await import("./lib/chain-context");
+    const w = b.web3;
+    const language = String(w.language ?? "solidity").toLowerCase();
+    const ecosystem = w.ecosystem ? normalizeEcosystem(w.ecosystem) : ecosystemFromLang(language as any);
+    const sourceMode = ["verified-onchain", "abi-only", "repo"].includes(w.sourceMode) ? w.sourceMode : "verified-onchain";
+    recipe = {
+      web3: {
+        ecosystem, language, sourceMode,
+        network: w.network ? String(w.network) : undefined,
+        forkBlock: w.forkBlock != null ? Number(w.forkBlock) : undefined,
+        repo: w.repo ? String(w.repo).trim() : undefined,
+        contracts: Array.isArray(w.contracts) ? w.contracts.map((x: any) => ({
+          address: x.address ? String(x.address) : undefined,
+          name: x.name ? String(x.name) : undefined,
+          verified: typeof x.verified === "boolean" ? x.verified : undefined,
+          abiProvided: typeof x.abiProvided === "boolean" ? x.abiProvided : undefined,
+        })) : [],
+        notes: w.notes ? String(w.notes) : undefined,
+      },
+    };
   }
   const ok = await setProgramRecipe(c.req.param("slug"), mode as any, recipe);
   if (!ok) return c.json({ error: "not_found" }, 404);
@@ -372,17 +616,52 @@ app.post("/api/programs/:slug/reports/:id/verify", async (c) => {
   const { verifySubmission } = await import("./lib/verify");
   const result = await verifySubmission(recipe, { impact: pocInput.impact, requests: pocInput.requests, assertion });
 
+  // Publish the evidence bundle (transcript + evidence hash) to Swarm so the
+  // machine verdict is permanently auditable — the "responsible AI" guarantee:
+  // an AI graded this, and here is the exact, immutable evidence anyone can check.
+  let evidenceSwarmRef: string | null = null;
+  if (SWARM_ENABLED) {
+    try {
+      const bundle = JSON.stringify({
+        kind: "monbounty.evidence", version: 1,
+        reportId: report.id, program: prog.slug, impact: pocInput.impact,
+        proven: result.proven, assertionMatched: result.assertionMatched,
+        surface: result.surface ?? null, representative: result.representative ?? null,
+        evidenceHash: result.evidenceHash, transcript: result.transcript, log: result.log,
+        verifiedAt: new Date().toISOString(),
+      });
+      // ENCRYPTED — the transcript replays the exploit, so it's as sensitive as
+      // the PoC itself. The reference embeds the key; only ref-holders can read it.
+      const up = await swarmUpload(bundle, { encrypt: true, filename: `${report.id}.evidence.json`, contentType: "application/json" });
+      evidenceSwarmRef = up.reference;
+      await setReportSwarm(report.id, "evidence", evidenceSwarmRef);
+    } catch (e) {
+      console.warn(`[swarm] evidence publish failed for ${report.id}:`, String(e).slice(0, 160));
+    }
+  }
+
   // Determine severity from the proven impact.
   const impact = IMPACT_BY_ID.get(pocInput.impact);
   const verdict = result.proven ? "valid" : "unproven";
   return c.json({
+    evidenceSwarm: evidenceSwarmRef ? { reference: evidenceSwarmRef, url: bzzUrl(evidenceSwarmRef) } : null,
     reportId: report.id, program: prog.slug, verificationMode: "company-attested",
     verdict, proven: result.proven, impact: pocInput.impact,
     severity: result.proven ? impact?.severity ?? null : null,
+    // What the PoC was replayed against. When representative is false the
+    // sandbox couldn't reproduce the declared production platform, so a proven
+    // result is "reproduced here" not "exploitable in prod" — the ruler
+    // confirms against production before settling.
+    surface: result.surface ?? null,
+    representative: result.representative ?? null,
     evidenceHash: result.evidenceHash, transcript: result.transcript, log: result.log,
-    note: result.proven
-      ? "Impact proven by executing the PoC against a fresh fork of the company's repo. Sign this verdict + evidence hash and settle."
-      : "PoC did not satisfy the committed impact assertion against the forked deploy.",
+    note: !result.proven
+      ? "PoC did not satisfy the committed impact assertion against the forked deploy."
+      : result.representative === false
+        ? `Impact reproduced in the sandbox, but against ${result.surface} — this does NOT faithfully represent the ` +
+          "declared production platform. Confirm the exploit against the real deployment before signing/settling."
+        : `Impact proven by executing the PoC against a fresh fork of the company's repo (${result.surface}). ` +
+          "Sign this verdict + evidence hash and settle.",
   });
 });
 
@@ -413,6 +692,9 @@ for (const [path, status] of [["approve", "approved"], ["reject", "rejected"]] a
  */
 app.get("/api/programs/:slug/reports", async (c) => {
   const slug = c.req.param("slug");
+  // The raw finding + PoC is the sensitive part of a bounty submission — only the
+  // program's own team (admin) sees it; the public feed shows the outcome trace.
+  const isAdmin = requireAdmin(c);
   const rows = await db
     .query<ReportRow, [string]>("SELECT * FROM reports WHERE program = ? ORDER BY created_at DESC LIMIT 100")
     .all(slug);
@@ -459,9 +741,10 @@ app.get("/api/programs/:slug/reports", async (c) => {
     return {
       id: r.id, title: r.title, severity: r.severity, status: r.status,
       hunter: r.payer, bondUsd, payoutUsd: r.payout_usd, createdAt: r.created_at, triagedAt: r.triaged_at,
-      hasPoc: Boolean(r.poc),
-      // The company owns this bounty, so it sees the full finding to triage.
-      summary: r.summary, asset: r.asset, poc, contentHash: r.content_hash,
+      network: r.network, hasPoc: Boolean(r.poc),
+      // Full finding (summary + exploit PoC) is admin-only; redacted for the public feed.
+      ...(isAdmin ? { summary: r.summary, asset: r.asset, poc } : {}),
+      contentHash: r.content_hash,
       risk: { decision: risk.decision, tier: risk.tier, valid: risk.valid, slop: risk.slop, agentId: risk.agentId },
       trace,
     };
@@ -623,6 +906,7 @@ app.get("/api/programs/:slug/rules", async (c) => {
     rulesHash: p.rules_hash,
     verified: recomputed === p.rules_hash,
     onchain: bountyOnchainParams(rules),
+    storage: storageBlock(p),
     verificationMode: p.verification_mode,
     pool: { committedUsd: p.pool_committed_usd, fundedUsd: p.pool_funded_usd,
             solvent: p.pool_funded_usd >= p.pool_committed_usd },
@@ -631,6 +915,103 @@ app.get("/api/programs/:slug/rules", async (c) => {
       return i ? { id, severity: i.severity, label: i.label, machineCheckable: Boolean(i.invariant) } : { id, unknown: true };
     }),
   });
+});
+
+/**
+ * The three-way integrity proof for a program, computed LIVE:
+ *   1. on-chain rulesHash (committed in SubmissionRegistry at createBounty)
+ *   2. Swarm: fetch the rules back from the public gateway, keccak256 the bytes
+ *   3. ENS: read the name's contenthash from mainnet and decode its Swarm ref
+ * If all three agree, the rules a hunter reads are provably the exact ones the
+ * company is bound to — and no party can quietly alter them after publication.
+ */
+app.get("/api/programs/:slug/proof", async (c) => {
+  const p = await getProgramRow(c.req.param("slug"));
+  if (!p || !p.rules_hash) return c.json({ error: "not_found" }, 404);
+
+  const swarm: any = { reference: p.rules_swarm_ref, ok: false };
+  if (p.rules_swarm_ref) {
+    try {
+      const v = await swarmVerify(p.rules_swarm_ref, p.rules_hash);
+      swarm.ok = v.ok;
+      swarm.retrievedHash = v.retrievedHash;
+      swarm.bytes = v.bytes;
+      swarm.url = bzzUrl(p.rules_swarm_ref);
+    } catch (e) {
+      swarm.error = String(e).slice(0, 160);
+    }
+  }
+
+  const ensName = p.ens_name ?? programEnsName(p.slug);
+  const ens: any = {
+    name: ensName,
+    expectedContenthash: p.rules_swarm_ref && isPlainSwarmRef(p.rules_swarm_ref)
+      ? encodeSwarmContenthash(p.rules_swarm_ref) : null,
+    resolves: false,
+  };
+  if (c.req.query("ens") === "1") {
+    try {
+      const r = await readEnsSwarm(ensName);
+      ens.resolver = r.resolver;
+      ens.onchainContenthash = r.contenthash;
+      ens.onchainSwarmRef = r.swarmRef;
+      ens.resolves = Boolean(r.swarmRef) && r.swarmRef === p.rules_swarm_ref;
+    } catch (e) {
+      ens.error = String(e).slice(0, 160);
+    }
+  }
+
+  return c.json({
+    slug: p.slug,
+    onchain: { rulesHash: p.rules_hash },
+    swarm,
+    ens,
+    // The core claim: the committed hash equals what Swarm serves. (ENS match is
+    // only asserted when ?ens=1 forces a live mainnet read.)
+    allMatch: swarm.ok && (c.req.query("ens") !== "1" || ens.resolves),
+  });
+});
+
+/**
+ * The exact transaction a name owner signs to point their ENS name at this
+ * program's Swarm-stored rules. monbounty never holds the name's key — it just
+ * produces the calldata; the human sends it from their own wallet.
+ */
+app.get("/api/programs/:slug/ens-plan", async (c) => {
+  const p = await getProgramRow(c.req.param("slug"));
+  if (!p || !p.rules_hash) return c.json({ error: "not_found" }, 404);
+  if (!p.rules_swarm_ref || !isPlainSwarmRef(p.rules_swarm_ref)) {
+    return c.json({ error: "no_swarm_ref", hint: "publish rules to Swarm first" }, 409);
+  }
+  const name = c.req.query("name") ?? p.ens_name ?? programEnsName(p.slug);
+  const plan = setContenthashPlan(name, p.rules_swarm_ref);
+  return c.json({
+    ...plan,
+    resolverHint: "Send `calldata` to the name's ENS resolver (Public Resolver setContenthash).",
+    dweb: `https://${name}.limo`,
+  });
+});
+
+/** (Re)publish a program's canonical rules to Swarm and record the reference. */
+app.post("/api/programs/:slug/republish-swarm", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const p = await getProgramRow(c.req.param("slug"));
+  if (!p || !p.rules_hash) return c.json({ error: "not_found" }, 404);
+  const rules: BountyRules = {
+    slug: p.slug, name: p.name, target: p.target ?? "",
+    scopeIn: JSON.parse(p.scope_in ?? "[]"), scopeOut: JSON.parse(p.scope_out ?? "[]"),
+    payouts: JSON.parse(p.payouts ?? "{}"), bondUsd: p.bond_usd,
+    acceptedImpacts: JSON.parse(p.accepted_impacts ?? "[]"),
+    slaSeconds: p.sla_seconds ?? 0, ruler: p.ruler ?? "",
+  };
+  const up = await swarmUpload(canonicalRules(rules), {
+    filename: `${p.slug}.rules.json`, contentType: "application/json",
+  });
+  const ensName = p.ens_name ?? programEnsName(p.slug);
+  await setProgramSwarm(p.slug, up.reference, ensName);
+  const matchesOnchain = up.contentHash.toLowerCase() === p.rules_hash.toLowerCase();
+  return c.json({ slug: p.slug, swarm: { reference: up.reference, url: up.url, bytes: up.bytes },
+    ensName, contentHash: up.contentHash, rulesHash: p.rules_hash, matchesOnchain });
 });
 
 /** Fund the reward pool. Mirrors the hunter funding paths (fiat via Ramp / USDC). */
@@ -853,10 +1234,24 @@ app.post("/api/funding-requests/:id/confirm", async (c) => {
 const SEVERITIES = ["critical", "high", "medium", "low", "informational"];
 
 app.post("/api/v1/reports", async (c) => {
-  const { payer, network } = decodePaymentHeader(paymentHeader(c));
-  if (!payer) return c.json({ error: "no_payer", detail: "Could not read payer from the payment header" }, 400);
-  const paidNet = netById(network);
-  if (!paidNet) return c.json({ error: "unsupported_network", network }, 400);
+  const dec = decodePaymentHeader(paymentHeader(c));
+  // Solana (SVM) payments carry a signed transaction, not an EIP-3009
+  // authorization, so the payer isn't in the header. The payment is already
+  // verified + settled by the facilitator before this handler runs; the client
+  // labels it with ?chain=solana&payer=<address> so we record who paid.
+  const isSvm = c.req.query("chain") === "solana";
+  let payer = dec.payer;
+  let paidNet: any;
+  if (isSvm) {
+    payer = c.req.query("payer") ?? null;
+    if (!payer || !isSolanaAddress(payer))
+      return c.json({ error: "no_payer", detail: "Pass ?payer=<solana address> for a Solana payment" }, 400);
+    paidNet = { id: "solana-devnet", name: "Solana Devnet", key: "solana", testnet: true };
+  } else {
+    if (!payer) return c.json({ error: "no_payer", detail: "Could not read payer from the payment header" }, 400);
+    paidNet = netById(dec.network);
+    if (!paidNet) return c.json({ error: "unsupported_network", network: dec.network }, 400);
+  }
 
   let body: any;
   try {
@@ -949,7 +1344,10 @@ app.post("/api/v1/reports", async (c) => {
 
 // ── paid intake: step 2 ─────────────────────────────────────────────────────
 app.post("/api/v1/reports/:id/poc", async (c) => {
-  const { payer, network } = decodePaymentHeader(paymentHeader(c));
+  const dec = decodePaymentHeader(paymentHeader(c));
+  const isSvm = c.req.query("chain") === "solana";
+  const payer = isSvm ? (c.req.query("payer") ?? null) : dec.payer;
+  const network = isSvm ? "solana-devnet" : dec.network;
   const id = c.req.param("id");
   const r = await db.query<ReportRow, [string]>("SELECT * FROM reports WHERE id = ?").get(id);
   if (!r) return c.json({ error: "not_found" }, 404);
@@ -979,7 +1377,32 @@ app.post("/api/v1/reports/:id/poc", async (c) => {
                         status = 'triaging' WHERE id = ?`,
     [poc, Number((r.bond_usd * POC_MULTIPLIER).toFixed(3)), nonce, id],
   );
-  return c.json({ id, status: "triaging", network: r.network, totalBondedUsd: Number((r.bond_usd * (1 + POC_MULTIPLIER)).toFixed(3)) });
+
+  // Snapshot the complete report (findings + PoC) to Swarm, ENCRYPTED. This is
+  // the hunter's censorship-resistant copy: once it's on Swarm the company can't
+  // make a valid finding disappear, and the reference is a capability only its
+  // holders can decrypt. Non-fatal if Swarm is briefly unreachable.
+  let swarmRef: string | null = null;
+  if (SWARM_ENABLED) {
+    try {
+      const doc = JSON.stringify({
+        kind: "monbounty.report", version: 1,
+        reportId: id, program: r.program, payer: r.payer,
+        title: r.title, severity: r.severity, summary: r.summary, asset: r.asset,
+        contentHash: r.content_hash, poc, submittedAt: new Date().toISOString(),
+      });
+      const up = await swarmUpload(doc, { encrypt: true, filename: `${id}.report.json`, contentType: "application/json" });
+      swarmRef = up.reference;
+      await setReportSwarm(id, "content", swarmRef);
+    } catch (e) {
+      console.warn(`[swarm] report snapshot failed for ${id}:`, String(e).slice(0, 160));
+    }
+  }
+  return c.json({ id, status: "triaging", network: r.network,
+    totalBondedUsd: Number((r.bond_usd * (1 + POC_MULTIPLIER)).toFixed(3)),
+    storage: swarmRef ? { swarm: { reference: swarmRef, encrypted: true,
+      note: "Your full report is stored encrypted on Swarm; keep this reference as your durable, censorship-resistant copy." } } : null,
+  });
 });
 
 // ── triage (admin) ──────────────────────────────────────────────────────────
@@ -1088,6 +1511,32 @@ app.post("/api/admin/reports/:id/verdict", async (c) => {
     [status, body.note ?? null, body.refundTx ?? null, payout, body.payoutTx ?? null, id],
   );
 
+  // Publish the signed verdict to Swarm — the final, immutable record of what
+  // was decided, by whom, and against which evidence. Links the report and
+  // evidence artifacts, so the whole submission→verdict trail is auditable.
+  let verdictSwarmRef: string | null = null;
+  if (SWARM_ENABLED) {
+    try {
+      // The verdict is the public, auditable record of the outcome — so it holds
+      // only HASHES (integrity commitments), never the Swarm references, which are
+      // capabilities that embed decryption keys for the report + evidence.
+      const doc = JSON.stringify({
+        kind: "monbounty.verdict", version: 1,
+        reportId: id, program: r.program, status,
+        payoutUsd: payout, note: body.note ?? null,
+        refundTx: body.refundTx ?? null, payoutTx: body.payoutTx ?? null,
+        contentHash: r.content_hash ?? null,
+        evidenceHash: body.evidenceHash ?? null,
+        ruler: body.ruler ?? null, gradedAt: new Date().toISOString(),
+      });
+      const up = await swarmUpload(doc, { filename: `${id}.verdict.json`, contentType: "application/json" });
+      verdictSwarmRef = up.reference;
+      await setReportSwarm(id, "verdict", verdictSwarmRef);
+    } catch (e) {
+      console.warn(`[swarm] verdict publish failed for ${id}:`, String(e).slice(0, 160));
+    }
+  }
+
   // Refund policy is declared here and settled out-of-band: the exact scheme
   // pays straight through to payTo, so there is no on-chain hold to release.
   // Swap payTo for the escrow contract to make this enforceable.
@@ -1099,6 +1548,7 @@ app.post("/api/admin/reports/:id/verdict", async (c) => {
     payoutUsd: payout,
     disposition: status === "valid" || status === "duplicate" ? "refund_due" : "slashed",
     payer: r.payer,
+    verdictSwarm: verdictSwarmRef ? { reference: verdictSwarmRef, url: bzzUrl(verdictSwarmRef) } : null,
     reputation: await reputationFor(r.payer),
   });
 });
@@ -1327,15 +1777,23 @@ app.post("/api/v1/wallets", async (c) => {
   const netKey = String(body.network ?? NET.key);
   const net = ENABLED.find((n) => n.key === netKey || n.id === netKey) ?? NET;
   const label = body.label ? String(body.label).slice(0, 64) : null;
+  const spendCap = Number.isFinite(Number(body.spendCapUsd)) && Number(body.spendCapUsd) > 0 ? Number(body.spendCapUsd) : null;
+
+  // Link to the caller's account when they authenticate with an account api key
+  // (the recommended default: the account is the durable identity, the wallet its
+  // signer). Standalone wallets stay allowed for backward-compat.
+  let accountId: string | null = null;
+  const authTok = bearer(c);
+  if (authTok?.startsWith("mb_ak_")) accountId = await resolveApiKey(authTok);
 
   try {
     const w = await createWallet(net);
     const token = `w402_${Buffer.from(crypto.getRandomValues(new Uint8Array(24))).toString("base64url")}`;
     const id = crypto.randomUUID();
     await db.run(
-      `INSERT INTO agent_wallets (id, provider, provider_id, address, network, token_hash, label)
-       VALUES (?,?,?,?,?,?,?)`,
-      [id, "circle", w.walletId, w.address, net.id, await hashToken(token), label],
+      `INSERT INTO agent_wallets (id, provider, provider_id, address, network, token_hash, label, account_id, spend_cap_usd)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [id, "circle", w.walletId, w.address, net.id, await hashToken(token), label, accountId, spendCap],
     );
     await touchHunter(w.address);
     return c.json(
@@ -1389,13 +1847,487 @@ app.post("/api/v1/wallets/:id/sign", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body?.typedData) return c.json({ error: "typedData required" }, 400);
 
+  // The choke point: only sign a whitelisted x402 bond to our own intake — never
+  // an arbitrary transfer. A stolen walletToken therefore cannot drain the wallet.
+  const guard = assertBondAuthorization(body.typedData, { address: row.address, network: row.network });
+  if (!guard.ok) return c.json({ error: "payload_not_whitelisted", detail: guard.error }, 403);
+
+  // Per-token spend cap (null = unlimited).
+  if (row.spend_cap_usd != null && row.spent_usd + guard.valueUsd > row.spend_cap_usd + 1e-9)
+    return c.json({ error: "cap_exceeded", detail: `cap $${row.spend_cap_usd}, spent $${row.spent_usd}, this $${guard.valueUsd}` }, 403);
+
   try {
     const signature = await signTypedData(row.provider_id, body.typedData);
-    await db.run("UPDATE agent_wallets SET last_used_at = datetime('now') WHERE id = ?", [row.id]);
+    await addWalletSpend(row.id, guard.valueUsd);
     return c.json({ signature, address: row.address });
   } catch (e: any) {
     return c.json({ error: "sign_failed", detail: String(e?.message ?? e) }, 502);
   }
+});
+
+/**
+ * Move winnings out — the ONE sanctioned exit. The wallet signs (via Circle) an
+ * EIP-3009 transfer to the account's BOUND address; the platform broadcasts it
+ * (gasless for the hunter). Destination is the recovery-gated bound address, so a
+ * stolen walletToken can only ever send the hunter's own funds to the hunter's
+ * own address — never a drain.
+ */
+app.post("/api/v1/wallets/:id/payout", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const token = bearer(c);
+  if (!token) return c.json({ error: "missing_wallet_token" }, 401);
+  const row = await walletByToken(c.req.param("id"), await hashToken(token));
+  if (!row) return c.json({ error: "invalid_wallet_token" }, 401);
+  if (!row.account_id) return c.json({ error: "wallet_not_linked", detail: "This wallet is not under an account; no bound address to pay out to." }, 409);
+  const acct = await getAccount(row.account_id);
+  if (!acct?.bound_withdraw_address)
+    return c.json({ error: "no_bound_address", detail: "Bind a withdrawal address (recovery-gated) before paying out." }, 409);
+
+  const body = await c.req.json().catch(() => ({}) as any);
+  const usd = Number(body?.amountUsd ?? 0);
+  if (!(usd > 0)) return c.json({ error: "bad_amount" }, 422);
+  const net = netById(row.network) ?? NET;
+  const to = acct.bound_withdraw_address as `0x${string}`;
+  const value = BigInt(Math.round(usd * 10 ** net.usdcDecimals));
+  const nonce = ("0x" + Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex")) as `0x${string}`;
+  const validAfter = 0n;
+  const validBefore = BigInt(Math.floor(Date.now() / 1000) + 3600);
+
+  // Build the EIP-3009 typed data, have Circle sign it, then broadcast it.
+  const typedData = {
+    domain: { name: net.usdcName, version: net.usdcVersion, chainId: net.chainId, verifyingContract: net.usdc },
+    types: {
+      EIP712Domain: [
+        { name: "name", type: "string" }, { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" }, { name: "verifyingContract", type: "address" } ],
+      TransferWithAuthorization: [
+        { name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" },
+        { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" },
+      ] },
+    primaryType: "TransferWithAuthorization",
+    message: { from: row.address, to, value: value.toString(), validAfter: validAfter.toString(), validBefore: validBefore.toString(), nonce },
+  };
+  try {
+    const signature = await signTypedData(row.provider_id, typedData);
+    const res = await treasury().submitTransferAuthorization(net.key, { from: row.address, to, value, validAfter, validBefore, nonce }, signature as `0x${string}`);
+    if (!res.ok) return c.json({ error: "payout_broadcast_failed", detail: res.error }, 502);
+    // Winnings are now in the hunter's own (bound) wallet. Offer the Ramp off-ramp
+    // so the human can sell USDC → their bank/card (Ramp runs the KYC). null on testnet.
+    const offramp = offrampUrl(to, net, usd);
+    return c.json({ ok: true, to, amountUsd: usd, txHash: res.txHash, explorerUrl: res.explorerUrl,
+      cashOut: offramp ? { provider: "Ramp Network", url: offramp, note: "Open to sell this USDC to your bank/card." }
+        : { available: false, reason: "No fiat off-ramp for testnet tokens." } });
+  } catch (e: any) {
+    return c.json({ error: "payout_failed", detail: String(e?.message ?? e) }, 502);
+  }
+});
+
+/** Rotate a wallet's runtime token (account-authed): new token, old one revoked. */
+app.post("/api/v1/wallets/:id/rotate", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const owner = await resolveOwner(c);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const wallet = await getAgentWallet(c.req.param("id"));
+  if (!wallet) return c.json({ error: "not_found" }, 404);
+  // Only the owning account (or admin) may rotate.
+  const isOwner = owner.ref === accountRef(wallet.account_id ?? "__none__") || bearer(c) === ADMIN_TOKEN;
+  if (!isOwner) return c.json({ error: "forbidden" }, 403);
+  const newToken = `w402_${Buffer.from(crypto.getRandomValues(new Uint8Array(24))).toString("base64url")}`;
+  await db.run("UPDATE agent_wallets SET token_hash = ?, revoked_at = NULL, last_used_at = datetime('now') WHERE id = ?", [await hashToken(newToken), wallet.id]);
+  return c.json({ walletId: wallet.id, walletToken: newToken, note: "Old token is now invalid. Store this one." });
+});
+
+// ── custodial balance layer (fiat + crypto → one internal balance) ───────────
+//
+// Everything here is gated on CUSTODY_ENABLED (off in prod until the money-
+// transmission question is answered) and testnet + Stripe sandbox only.
+//
+// owner_ref binding:
+//  - admin token asserting on behalf of a portal-authenticated user (the Next
+//    company-api proxies verify the Supabase session, then pass ownerRef=email);
+//  - a wallet bearer token (X-Wallet-Id + Authorization) for an agent acting as
+//    its own address. A client can never set an owner_ref it hasn't proven.
+const bearer = (c: any): string => (c.req.header("authorization") ?? "").replace(/^Bearer\s+/i, "");
+async function resolveOwner(
+  c: any, requestedRef?: unknown,
+): Promise<{ ref: string } | { error: string; code: number }> {
+  const auth = bearer(c);
+  if (auth && auth === ADMIN_TOKEN) {
+    const ref = requestedRef ?? c.req.query("ownerRef") ?? c.req.header("x-owner-ref");
+    if (!ref) return { error: "ownerRef_required", code: 400 };
+    return { ref: String(ref).toLowerCase() };
+  }
+  // Account API key — the durable identity. owner_ref = account:<id>, so balance
+  // and rewards follow the account across sessions and lost wallet keys.
+  if (auth.startsWith("mb_ak_")) {
+    const accountId = await resolveApiKey(auth);
+    if (accountId) return { ref: accountRef(accountId) };
+  }
+  const walletId = c.req.header("x-wallet-id");
+  if (walletId && auth) {
+    const row = await walletByToken(walletId, await hashToken(auth));
+    if (row) return { ref: row.address.toLowerCase() };
+  }
+  return { error: "unauthorized", code: 401 };
+}
+const custodyOff = (c: any) =>
+  !CUSTODY_ENABLED ? c.json({ error: "custody_disabled", detail: "CUSTODY_ENABLED is not set on this deployment." }, 501) : null;
+
+let _treasury: ReturnType<typeof treasuryFromEnv> | null = null;
+const treasury = () => (_treasury ??= treasuryFromEnv());
+
+/** What the portal needs to render the deposit UI. */
+app.get("/api/v1/custody/config", (c) =>
+  c.json({
+    enabled: CUSTODY_ENABLED,
+    stripe: stripeConfigured(),
+    stripeWebhookReady: stripeWebhookReady(),
+    publishableKey: STRIPE_PUBLISHABLE_KEY || null,
+    depositAddress: PLATFORM_DEPOSIT_ADDRESS || null,
+    networks: ENABLED.map((n) => ({ key: n.key, id: n.id, name: n.name, testnet: n.testnet })),
+  }),
+);
+
+// ── accounts: the durable identity that owns the balance ─────────────────────
+
+/**
+ * Register an account on the first curl. Returns an api_key (the runtime
+ * credential) AND a recovery code — BOTH shown once. The recovery code is
+ * mandatory: it is what re-mints an api_key if the agent's key is ever lost, so
+ * a lost key never loses the money. Open registration (trust-on-first-use); an
+ * account only matters once it is funded.
+ */
+app.post("/api/v1/accounts/register", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const kind: AccountKind = body?.kind === "company" ? "company" : "hunter";
+  const accountId = await createAccount(kind);
+  const apiKey = await issueCredential(accountId, "api_key", body?.label ? String(body.label).slice(0, 64) : "initial");
+  const recoveryCode = await issueCredential(accountId, "recovery");
+  // Identity is platform-owned, created at signup — not the agent's or company's
+  // job. On testnet there are no ERC-8004 registries, so it's a clean skip and
+  // submissions are never blocked; on mainnet the platform registers it (via the
+  // account's Circle wallet, gas sponsored) — see /api/agents/:address/identity.
+  const identityStatus = NET.testnet ? "skipped_testnet" : "pending_mainnet";
+  await db.run("UPDATE accounts SET identity_status = ? WHERE id = ?", [identityStatus, accountId]);
+  return c.json({
+    accountId, kind, apiKey, recoveryCode, identityStatus,
+    ownerRef: accountRef(accountId),
+    note: "STORE BOTH NOW — shown once. Use apiKey as `Authorization: Bearer <apiKey>` for account/wallet/balance calls. Keep recoveryCode OFFLINE (not next to the api key): it re-mints an apiKey if the key is lost, and is required to change the withdrawal address.",
+  }, 201);
+});
+
+/**
+ * Recover an account: present the recovery code, get a FRESH api_key. Every
+ * existing api_key is revoked (a thief holding the old one is locked out) and
+ * the recovery code is rotated, so store the new pair.
+ */
+app.post("/api/v1/accounts/recover", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const code = String(body?.recoveryCode ?? "");
+  const accountId = await verifyRecovery(code);
+  if (!accountId) return c.json({ error: "invalid_recovery_code" }, 401);
+  await revokeApiKeys(accountId);                       // lock out any lost/leaked key
+  const apiKey = await issueCredential(accountId, "api_key", "recovered");
+  const recoveryCode = await rotateRecovery(accountId); // one-time use, rotate it
+  return c.json({
+    accountId, apiKey, recoveryCode, ownerRef: accountRef(accountId),
+    note: "Recovered. Old api keys are revoked. Store the NEW apiKey + recoveryCode; your balance is unchanged.",
+  });
+});
+
+/** Mint an additional api_key for the authenticated account (e.g. per agent). */
+app.post("/api/v1/accounts/keys", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const owner = await resolveOwner(c);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  if (!owner.ref.startsWith("account:")) return c.json({ error: "not_an_account" }, 400);
+  const accountId = owner.ref.slice("account:".length);
+  const body = await c.req.json().catch(() => ({}) as any);
+  const apiKey = await issueCredential(accountId, "api_key", body?.label ? String(body.label).slice(0, 64) : "additional");
+  return c.json({ apiKey, note: "Shown once." }, 201);
+});
+
+/**
+ * Bind/change the withdrawal address (the backstop). Authorised by the RECOVERY
+ * CODE, not an api key — changing where money can go is a root action, so a
+ * leaked runtime credential (api key or walletToken) can never redirect funds.
+ */
+app.post("/api/v1/accounts/bind-withdrawal", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const addr = String(body?.address ?? "");
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) return c.json({ error: "bad_address" }, 422);
+  const accountId = await verifyRecovery(String(body?.recoveryCode ?? ""));
+  if (!accountId) return c.json({ error: "recovery_code_required", detail: "Changing the withdrawal address requires the account recovery code." }, 401);
+  await setBoundWithdrawAddress(accountId, addr.toLowerCase());
+  return c.json({ ok: true, boundWithdrawAddress: addr.toLowerCase() });
+});
+
+/** Who am I — resolve the caller's account + balance. */
+app.get("/api/v1/accounts/me", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const owner = await resolveOwner(c);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const out: any = { ownerRef: owner.ref, balanceUsd: await balanceUsd(userRef(owner.ref)) };
+  if (owner.ref.startsWith("account:")) {
+    const a = await getAccount(owner.ref.slice("account:".length));
+    if (a) { out.accountId = a.id; out.kind = a.kind; out.boundWithdrawAddress = a.bound_withdraw_address; }
+  }
+  return c.json(out);
+});
+
+/**
+ * Cash-out link: a Ramp off-ramp URL to sell USDC → bank/card from a wallet the
+ * human controls (their bound address by default). Ramp runs the KYC; the
+ * platform just hands over the prefilled URL. Mainnet only (no testnet fiat).
+ */
+app.get("/api/v1/offramp", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const owner = await resolveOwner(c);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const usd = Number(c.req.query("amountUsd") ?? 0);
+  const net = netById(c.req.query("network") ?? "") ?? NET;
+  let address = String(c.req.query("address") ?? "");
+  if (!address && owner.ref.startsWith("account:")) {
+    const a = await getAccount(owner.ref.slice("account:".length));
+    address = a?.bound_withdraw_address ?? "";
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address))
+    return c.json({ error: "no_address", detail: "Bind a withdrawal address (recovery-gated) or pass ?address=." }, 409);
+  const url = offrampUrl(address, net, usd > 0 ? usd : undefined);
+  if (!url) return c.json({ available: false, reason: "No fiat off-ramp for testnet tokens." });
+  return c.json({ available: true, provider: "Ramp Network", address, url });
+});
+
+/** The caller's own balance + recent deposits/withdrawals/history. */
+app.get("/api/v1/balance", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const owner = await resolveOwner(c);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const atomic = await balanceAtomic(userRef(owner.ref));
+  return c.json({
+    ownerRef: owner.ref,
+    balanceUsd: fromAtomic(atomic),
+    balanceAtomic: atomic.toString(),
+    deposits: (await listDeposits(owner.ref)).map((d) => ({ id: d.id, rail: d.rail, usd: fromAtomic(d.amount_atomic), status: d.status, chainTx: d.chain_tx, createdAt: d.created_at })),
+    withdrawals: (await listWithdrawals(owner.ref)).map((w) => ({ id: w.id, usd: fromAtomic(w.amount_atomic), to: w.to_address, status: w.status, chainTx: w.chain_tx, createdAt: w.created_at })),
+    history: (await ledgerHistory(userRef(owner.ref), 25)).map((h) => ({ usd: fromAtomic(h.deltaAtomic), memo: h.memo, at: h.createdAt })),
+  });
+});
+
+/** Fiat rail: create a Stripe Checkout Session for a top-up. */
+app.post("/api/v1/deposits/stripe", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  if (!stripeConfigured()) return c.json({ error: "stripe_not_configured" }, 501);
+  const body = await c.req.json().catch(() => ({}) as any);
+  const owner = await resolveOwner(c, body.ownerRef);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const usd = Number(body.amountUsd ?? 0);
+  if (!(usd > 0)) return c.json({ error: "bad_amount" }, 422);
+  const kind = body.kind === "company" ? "company" : "hunter";
+  const id = crypto.randomUUID();
+  try {
+    const session = await createCheckoutSession({ ownerRef: owner.ref, depositId: id, amountUsd: usd, kind });
+    await createDeposit(id, owner.ref, "stripe", toAtomic(usd), session.sessionId);
+    return c.json({ depositId: id, url: session.url, amountUsd: usd });
+  } catch (e: any) {
+    return c.json({ error: "stripe_checkout_failed", detail: String(e?.message ?? e) }, 502);
+  }
+});
+
+/**
+ * Stripe webhook — the money is only real once this fires. Verifies the raw
+ * body against the signing secret, then credits the balance idempotently
+ * (creditDeposit is a no-op if the txId was already posted, so a re-delivered
+ * event cannot double-credit). No bearer auth: the signature IS the auth.
+ */
+app.post("/api/stripe/webhook", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  if (!stripeWebhookReady()) return c.json({ error: "stripe_webhook_not_configured", detail: "Set STRIPE_WEBHOOK_SECRET (from `stripe listen`)." }, 501);
+  const sig = c.req.header("stripe-signature") ?? "";
+  const raw = await c.req.text();
+  let event: any;
+  try { event = await verifyWebhook(raw, sig); }
+  catch (e: any) { return c.json({ error: "bad_signature", detail: String(e?.message ?? e) }, 400); }
+
+  if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+    const s = event.data.object;
+    const depositId = s?.metadata?.depositId as string | undefined;
+    const dep = depositId ? await getDeposit(depositId) : (s?.id ? await getDepositByProvider("stripe", s.id) : null);
+    if (dep && dep.status === "open") {
+      const atomic = BigInt(dep.amount_atomic);
+      const txId = `stripe-deposit-${dep.id}`;
+      await creditDeposit(dep.owner_ref, atomic, "stripe", txId, `card deposit ${dep.id}`);
+      await markDepositCredited(dep.id, txId, null);
+      // Capture the payment_intent so this deposit can later be refunded to the card.
+      const pi = typeof s?.payment_intent === "string" ? s.payment_intent : s?.payment_intent?.id;
+      if (pi) await setDepositPaymentIntent(dep.id, pi);
+      // Conversion seam: on testnet a no-op; in prod this buys treasury USDC.
+      fiatToUsdc(fromAtomic(atomic)).then((r) => console.log(`[custody] ${dep.id} conversion: ${r.detail}`)).catch(() => {});
+      console.log(`[custody] stripe deposit ${dep.id} credited ${dep.owner_ref} +$${fromAtomic(atomic)}`);
+    }
+  }
+  return c.json({ received: true });
+});
+
+/** Crypto rail: hand back the deposit address + a UNIQUE exact amount to send. */
+app.post("/api/v1/deposits/crypto", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(PLATFORM_DEPOSIT_ADDRESS)) return c.json({ error: "no_deposit_address" }, 501);
+  const body = await c.req.json().catch(() => ({}) as any);
+  const owner = await resolveOwner(c, body.ownerRef);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const usd = Number(body.amountUsd ?? 0);
+  if (!(usd > 0)) return c.json({ error: "bad_amount" }, 422);
+  const net = netById(body.network) ?? NET;
+  // Unique sub-cent offset so concurrent sends are distinguishable by amount.
+  const expected = toAtomic(usd) + BigInt(1 + Math.floor(Math.random() * 999));
+  const id = crypto.randomUUID();
+  await createDeposit(id, owner.ref, "onchain", expected, id);
+  return c.json({
+    depositId: id,
+    network: net.id,
+    token: net.usdc,
+    to: PLATFORM_DEPOSIT_ADDRESS,
+    sendExactUsdc: fromAtomic(expected),
+    sendExactAtomic: expected.toString(),
+    note: "Send EXACTLY this amount of USDC to the address on this network. It is credited automatically once seen on-chain.",
+    ...(net.testnet ? {} : { rampUrl: rampUrl(PLATFORM_DEPOSIT_ADDRESS, net, usd) }),
+  });
+});
+
+/** Company: fund a bounty's reward pool from balance (chain hidden). */
+app.post("/api/programs/:slug/fund-from-balance", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const slug = c.req.param("slug");
+  const p = await getProgramRow(slug);
+  if (!p || !p.rules_hash) return c.json({ error: "not_found" }, 404);
+  const body = await c.req.json().catch(() => ({}) as any);
+  const owner = await resolveOwner(c, body.ownerRef);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const usd = Number(body.amountUsd ?? 0);
+  if (!(usd > 0)) return c.json({ error: "bad_amount" }, 422);
+  const txId = `fund-${slug}-${crypto.randomUUID()}`;
+  try { await moveUserToProgram(owner.ref, slug, toAtomic(usd), txId, `fund ${slug}`); }
+  catch (e: any) { return c.json({ error: "insufficient_balance", detail: String(e?.message ?? e) }, 422); }
+  const fundedTotal = await recordProgramFunding(slug, usd);
+  return c.json({
+    slug, fundedUsd: fundedTotal, committedUsd: p.pool_committed_usd,
+    solvent: fundedTotal >= p.pool_committed_usd,
+    balanceUsd: await balanceUsd(userRef(owner.ref)),
+  });
+});
+
+/** Withdraw balance to the user's own wallet — the escape hatch to self-custody. */
+app.post("/api/v1/withdrawals", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const owner = await resolveOwner(c, body.ownerRef);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+  const to = String(body.toAddress ?? "");
+  if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return c.json({ error: "bad_address" }, 422);
+  // Backstop: if the account bound a withdrawal address, payouts go ONLY there,
+  // so a leaked api_key cannot redirect funds. Changing it is a separate action.
+  if (owner.ref.startsWith("account:")) {
+    const acct = await getAccount(owner.ref.slice("account:".length));
+    if (acct?.bound_withdraw_address && acct.bound_withdraw_address !== to.toLowerCase())
+      return c.json({ error: "withdrawal_address_not_bound", detail: `This account withdraws only to ${acct.bound_withdraw_address}. Rebind to change it.` }, 403);
+  }
+  const usd = Number(body.amountUsd ?? 0);
+  if (!(usd > 0)) return c.json({ error: "bad_amount" }, 422);
+  const net = netById(body.network) ?? NET;
+  const atomic = toAtomic(usd);
+  const id = crypto.randomUUID();
+  const txId = `withdrawal-${id}`;
+
+  // Debit the ledger FIRST (this also enforces sufficient balance), then pay.
+  try { await debitWithdrawal(owner.ref, atomic, txId, `withdraw to ${to}`); }
+  catch (e: any) { return c.json({ error: "insufficient_balance", detail: String(e?.message ?? e) }, 422); }
+  await createWithdrawal(id, owner.ref, atomic, to, net.id);
+
+  let pay;
+  try { pay = await treasury().pay(to, usd, net.key); }
+  catch (e: any) { pay = { ok: false, error: String(e?.message ?? e) } as any; }
+  if (!pay.ok) {
+    // Reverse the debit so a failed payout never strands the user's balance.
+    await ledgerPost(`${txId}-refund`, "withdrawal failed refund", [
+      { account: userRef(owner.ref), deltaAtomic: atomic },
+      { account: externalRef("onchain_out"), deltaAtomic: -atomic },
+    ]);
+    await markWithdrawal(id, "failed", { error: pay.error });
+    return c.json({ error: "payout_failed", detail: pay.error }, 502);
+  }
+  await markWithdrawal(id, "paid", { txId, chainTx: pay.txHash });
+  return c.json({ ok: true, id, txHash: pay.txHash, explorerUrl: pay.explorerUrl, balanceUsd: await balanceUsd(userRef(owner.ref)) });
+});
+
+/**
+ * Refund deposited fiat back to the payer's card (the fiat exit). Bounded by the
+ * lesser of the account's current balance and the remaining refundable amount
+ * across its Stripe deposits. Money returns ONLY to the original card — Stripe
+ * won't redirect it — so this is safe under a plain api key. Omit amountUsd to
+ * refund the maximum (the "remaining deposit balance").
+ */
+app.post("/api/v1/refunds", async (c) => {
+  const off = custodyOff(c); if (off) return off;
+  if (!stripeConfigured()) return c.json({ error: "stripe_not_configured" }, 501);
+  const body = await c.req.json().catch(() => ({}) as any);
+  const owner = await resolveOwner(c, body.ownerRef);
+  if ("error" in owner) return c.json({ error: owner.error }, owner.code as any);
+
+  const balance = await balanceAtomic(userRef(owner.ref));
+  const deposits = await listRefundableStripeDeposits(owner.ref);
+  const totalRefundable = deposits.reduce((s, d) => s + (BigInt(d.amount_atomic) - BigInt(d.refunded_atomic)), 0n);
+  const maxRefund = balance < totalRefundable ? balance : totalRefundable;
+  if (maxRefund <= 0n) return c.json({ error: "nothing_refundable", detail: "No refundable Stripe deposit balance." }, 422);
+
+  const requested = body.amountUsd != null ? toAtomic(Number(body.amountUsd)) : maxRefund;
+  if (requested <= 0n) return c.json({ error: "bad_amount" }, 422);
+  if (requested > maxRefund)
+    return c.json({ error: "exceeds_refundable", detail: `max refundable now is $${fromAtomic(maxRefund)} (min of balance $${fromAtomic(balance)} and remaining deposits $${fromAtomic(totalRefundable)})` }, 422);
+
+  let left = requested;
+  const refunds: any[] = [];
+  for (const dep of deposits) {
+    if (left <= 0n) break;
+    const depRemaining = BigInt(dep.amount_atomic) - BigInt(dep.refunded_atomic);
+    const portion = depRemaining < left ? depRemaining : left;
+    if (portion <= 0n) continue;
+    const portionUsd = fromAtomic(portion);
+    try {
+      const refund = await createRefund(dep.stripe_payment_intent!, portionUsd);
+      await ledgerPost(`refund-${dep.id}-${refund.id}`, `stripe refund ${dep.id}`, [
+        { account: userRef(owner.ref), deltaAtomic: -portion },
+        { account: externalRef("stripe"), deltaAtomic: portion },
+      ]);
+      await addDepositRefunded(dep.id, portion);
+      refunds.push({ depositId: dep.id, refundId: refund.id, usd: portionUsd, status: refund.status });
+      left -= portion;
+    } catch (e: any) {
+      // Stop on the first Stripe error; report what already succeeded.
+      return c.json({ error: "refund_failed", detail: String(e?.message ?? e), refundedUsd: fromAtomic(requested - left), refunds, balanceUsd: await balanceUsd(userRef(owner.ref)) }, 502);
+    }
+  }
+  return c.json({ ok: true, refundedUsd: fromAtomic(requested - left), refunds, balanceUsd: await balanceUsd(userRef(owner.ref)) });
+});
+
+/** Solvency reconciliation: what we owe vs. what we actually hold. */
+app.get("/api/admin/solvency", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  let backingUsd = 0;
+  try { for (const n of ENABLED) { const b = await treasury().balance(n.key).catch(() => null); if (b) backingUsd += b.usdc; } }
+  catch { /* no treasury key — report claims only */ }
+  const integ = await integrity(toAtomic(backingUsd));
+  return c.json({
+    claimsUsd: integ.claimsUsd,
+    treasuryUsdcUsd: backingUsd,
+    backingUsd: integ.backingUsd,
+    driftUsd: fromAtomic(integ.driftAtomic),
+    invariantHolds: integ.driftAtomic === 0n,
+    solvent: integ.solvent,
+  });
 });
 
 // ── static ──────────────────────────────────────────────────────────────────
@@ -1406,6 +2338,11 @@ app.get("/docs", async (c) => c.html(await Bun.file(`${import.meta.dir}/web/docs
 
 console.log(
   `bounty402 on :${PORT}  networks=${ENABLED.map((n) => `${n.key}(${n.id})`).join(",")}  ` +
-    ENABLED.map((n) => `payTo[${n.key}]=${payToFor(n)}`).join("  "),
+    ENABLED.map((n) => `payTo[${n.key}]=${payToFor(n)}`).join("  ") +
+    (CUSTODY_ENABLED ? `  custody=on stripe=${stripeConfigured()} deposit=${PLATFORM_DEPOSIT_ADDRESS || "unset"}` : "  custody=off"),
 );
+
+// Crypto deposit rail: start watching the platform address for incoming USDC.
+startDepositWatcher();
+
 export default { port: PORT, hostname: "127.0.0.1", fetch: app.fetch, idleTimeout: 60 };

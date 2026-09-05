@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { api } from "@/lib/api";
 import type { Program, ProgramsResp } from "@/lib/types";
+import BalanceCard from "./BalanceCard";
 
 const money = (n: number) => (n >= 1000 ? `$${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : `$${n}`);
 const isWeb2 = (p: Program) => p.acceptedImpacts.some((i) => i.startsWith("web-"));
@@ -60,6 +61,9 @@ export default function Dashboard() {
           </div>
           <Link href="/company"><Button>+ New program</Button></Link>
         </div>
+
+        {/* unified balance: top up by card or crypto, fund pools, withdraw */}
+        <BalanceCard />
 
         {/* org stat strip */}
         <div className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">

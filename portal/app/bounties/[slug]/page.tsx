@@ -153,6 +153,42 @@ export default function ProgramPage() {
           </div>
         </Section>
 
+        {/* Censorship-resistant storage: Swarm + ENS */}
+        {d.storage?.swarm && (
+          <Section title="Censorship-resistant storage">
+            <div className="grid gap-2 text-xs">
+              <p className="text-muted-foreground">
+                These rules aren&apos;t just hashed — the exact bytes live on <b className="text-foreground">Swarm</b>,
+                a distributed storage network. <code className="text-emerald-400">keccak256</code> of what Swarm
+                serves equals the <code className="text-foreground">rulesHash</code> committed on-chain, so no party
+                can quietly rewrite the scope or payouts after publishing.
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-28 text-muted-foreground">🐝 Swarm ref</span>
+                <a href={d.storage.swarm.url} target="_blank" rel="noreferrer" className="break-all font-mono text-primary underline decoration-dotted">{d.storage.swarm.reference}</a>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <span className="min-w-28 text-muted-foreground">integrity</span>
+                <span className={d.verified ? "text-emerald-400" : "text-rose-400"}>{d.verified ? "Swarm bytes match the on-chain hash ✓" : "mismatch"}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-28 text-muted-foreground">🔵 ENS name</span>
+                <span className="font-mono text-foreground">{d.storage.ens.name}</span>
+              </div>
+              {d.storage.ens.contenthash && (
+                <div className="flex flex-wrap gap-2">
+                  <span className="min-w-28 text-muted-foreground">contenthash</span>
+                  <span className="break-all font-mono text-muted-foreground">{d.storage.ens.contenthash}</span>
+                </div>
+              )}
+              <p className="text-muted-foreground">
+                Set as the name&apos;s ENS contenthash, <span className="font-mono text-foreground">{d.storage.ens.name}</span> resolves
+                straight to these rules in any ENS-aware browser — a name a human can read, backed by content a company can&apos;t bury.
+              </p>
+            </div>
+          </Section>
+        )}
+
         {/* Submit */}
         <Card id="submit" className="border-primary/30">
           <CardHeader className="pb-3"><CardTitle className="text-xs font-semibold uppercase tracking-wider text-primary">Submit a finding</CardTitle></CardHeader>

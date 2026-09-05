@@ -55,6 +55,10 @@ export interface RulesDetail {
   };
   rulesHash: string;
   verified: boolean;
+  storage?: {
+    swarm: { reference: string; uri: string; url: string; gateway: string } | null;
+    ens: { name: string; contenthash: string | null; dweb: string };
+  };
   pool: { committedUsd: number; fundedUsd: number; solvent: boolean };
   impacts: { id: string; severity: Severity; label: string; machineCheckable: boolean; unknown?: boolean }[];
 }

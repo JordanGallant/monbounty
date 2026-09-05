@@ -89,6 +89,15 @@ export default function CompanyProgram() {
           ))}
         </div>
 
+        {/* Fund the reward pool from balance */}
+        {rules && (
+          <FundPanel
+            slug={slug}
+            pool={rules.pool}
+            onFunded={(fundedUsd, solvent) => setRules((r) => (r ? { ...r, pool: { ...r.pool, fundedUsd, solvent } } : r))}
+          />
+        )}
+
         {/* Verification target */}
         <RecipePanel slug={slug} />
 
@@ -124,6 +133,61 @@ export default function CompanyProgram() {
         </Card>
       </main>
     </div>
+  );
+}
+
+function FundPanel({
+  slug, pool, onFunded,
+}: {
+  slug: string;
+  pool: { committedUsd: number; fundedUsd: number; solvent: boolean };
+  onFunded: (fundedUsd: number, solvent: boolean) => void;
+}) {
+  const [amount, setAmount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const remaining = Math.max(0, pool.committedUsd - pool.fundedUsd);
+
+  async function fund() {
+    setBusy(true);
+    try {
+      const r = await api<{ fundedUsd: number; committedUsd: number; solvent: boolean; balanceUsd: number }>(
+        "/company-api/fund",
+        { method: "POST", body: JSON.stringify({ slug, amountUsd: Number(amount) }) },
+      );
+      onFunded(r.fundedUsd, r.solvent);
+      setAmount("");
+      toast.success(`Funded from balance. Pool ${money(r.fundedUsd)} / ${money(r.committedUsd)}${r.solvent ? " — live" : ""}. Balance left ${money(r.balanceUsd)}.`);
+    } catch (e: any) {
+      toast.error(e.message === "insufficient_balance" ? "Not enough balance — top up first." : (e.message ?? "funding failed"));
+    }
+    setBusy(false);
+  }
+
+  return (
+    <Card className="mb-6">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Reward pool</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="mb-3 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+          <span><span className="text-muted-foreground">Funded </span><span className="font-mono font-semibold">{money(pool.fundedUsd)}</span></span>
+          <span><span className="text-muted-foreground">Committed </span><span className="font-mono font-semibold">{money(pool.committedUsd)}</span></span>
+          <Badge className={pool.solvent ? "bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/15" : "bg-amber-500/15 text-amber-400"}>
+            {pool.solvent ? "● solvent" : `underfunded by ${money(remaining)}`}
+          </Badge>
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-1.5">
+            <Label htmlFor="fund-amt" className="text-xs text-muted-foreground">Fund from balance (USD)</Label>
+            <Input id="fund-amt" type="number" min="1" placeholder={remaining ? String(remaining) : "0"} value={amount} onChange={(e) => setAmount(e.target.value)} className="w-40" />
+          </div>
+          <Button disabled={busy || !(Number(amount) > 0)} onClick={fund}>Fund pool</Button>
+        </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Draws on your platform balance — no wallet, no gas. Top up by card or crypto above in the dashboard.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -27,6 +27,67 @@ export const COMPANY_TOOL_SPECS: Anthropic.Tool[] = [
     input_schema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "assess_deployment",
+    description:
+      "Assess WHERE the target runs before writing scope — exploitability is code × deployment, not code alone. " +
+      "Given the production platform (e.g. vercel, cloudflare-workers, aws-lambda, node, docker) and framework " +
+      "(e.g. nextjs), returns a deployment profile to commit with the verification recipe plus suggested scopeOut " +
+      "lines for classes commonly neutralised on that platform (e.g. Next.js middleware auth bypass is dead on " +
+      "Vercel). The company confirms the lines; fold accepted ones into scopeOut. Call this after read_target and " +
+      "before draft_bounty.",
+    input_schema: {
+      type: "object",
+      properties: {
+        platform: { type: "string", description: "Production host: vercel | netlify | cloudflare-workers | aws-lambda | node | docker | kubernetes." },
+        framework: { type: "string", description: "App framework, e.g. nextjs, express, django." },
+        frameworkVersion: { type: "string" },
+        runtime: { type: "string", description: "e.g. nodejs20.x" },
+        waf: { type: "boolean", description: "Is a WAF in front in production?" },
+        notes: { type: "string", description: "Anything about the deployment a sandbox run can't capture." },
+      },
+      required: ["platform"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "assess_web3",
+    description:
+      "Assess a SMART CONTRACT target before writing scope — the web3 counterpart of assess_deployment. " +
+      "Exploitability is code × VM: reentrancy is impossible on Move, delegatecall/storage-collision only on the " +
+      "EVM, silent overflow is neutralised on Solidity >=0.8 and Move. Covers Solidity/Vyper (EVM), Move (Aptos/Sui) " +
+      "and Rust (Solana/CosmWasm/ink). The target is ingested as a deployed+verified contract, a source repo " +
+      "(Foundry/Anchor/Move), or an ABI/IDL only. Returns a target profile for the onchain-fork recipe, scopeOut " +
+      "lines for classes not applicable on that VM, and the VM-specific classes to make sure you price. Call after " +
+      "read_target, before draft_bounty, for contract targets.",
+    input_schema: {
+      type: "object",
+      properties: {
+        ecosystem: { type: "string", description: "evm | solana | aptos | sui | cosmwasm | polkadot. Inferred from language if omitted." },
+        language: { type: "string", description: "solidity | vyper | move | rust." },
+        sourceMode: { type: "string", enum: ["verified-onchain", "abi-only", "repo"], description: "How the code is provided: a deployed+verified contract, an ABI/IDL only, or a source package." },
+        contracts: {
+          type: "array",
+          description: "The contracts in scope.",
+          items: {
+            type: "object",
+            properties: {
+              address: { type: "string" }, name: { type: "string" },
+              verified: { type: "boolean" }, abiProvided: { type: "boolean" },
+            },
+            additionalProperties: false,
+          },
+        },
+        repo: { type: "string", description: "Source package URL when sourceMode is 'repo'." },
+        network: { type: "string", description: "Chain id / cluster / testnet name." },
+        forkBlock: { type: "number", description: "Block to fork at for reproducible PoCs." },
+        solidityGte08: { type: "boolean", description: "EVM only: is the target on Solidity >=0.8 (checked arithmetic by default)?" },
+        notes: { type: "string" },
+      },
+      required: ["language", "sourceMode"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "propose_payouts",
     description:
       "Build a payout table from a preset ('onchain' or 'web2') or a TVL, with optional per-severity overrides. " +

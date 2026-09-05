@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { describeSurface, type DeploymentProfile } from "./deployment-context";
 
 export interface VerifyRecipe {
   repo: string;            // git URL (public for the demo; a private clone token in prod)
@@ -23,6 +24,12 @@ export interface VerifyRecipe {
   port?: number;           // the port the app listens on
   healthPath?: string;     // path polled for readiness (default "/")
   bootSec?: number;        // how long to wait for boot (default 25)
+  // Where/how the target runs in production. A raw runCmd only represents a
+  // self-hosted long-lived process; when the real deployment is a managed
+  // platform (Vercel, Workers, …) the sandbox can't reproduce it faithfully
+  // yet, so the verdict is labelled non-representative rather than silently
+  // read as "exploitable in prod". See lib/deployment-context.ts.
+  deployment?: DeploymentProfile;
 }
 
 export interface PocRequest {
@@ -46,6 +53,12 @@ export interface VerifyResult {
   evidenceHash: string;
   log: string[];
   error?: string;
+  // What the PoC was actually replayed against, and whether that surface
+  // faithfully represents the declared production platform. `proven` alone
+  // means "reproduced in the sandbox"; when representative is false the company
+  // must confirm it against the real deployment before treating it as payable.
+  surface?: string;
+  representative?: boolean;
 }
 
 // Cloned repo code runs with a MINIMAL env — the host's secrets (TREASURY_PRIVATE_KEY,
@@ -72,6 +85,8 @@ async function waitPort(url: string, deadline: number, log: string[]): Promise<b
 
 export async function verifySubmission(recipe: VerifyRecipe, poc: Poc): Promise<VerifyResult> {
   const log: string[] = [];
+  const { surface, representative } = describeSurface(recipe.deployment);
+  log.push(`surface: ${surface}${representative ? "" : " (NON-REPRESENTATIVE — company must confirm against production)"}`);
   const dir = mkdtempSync(join(tmpdir(), "mb-verify-"));
   const port = recipe.port ?? 4599;
   const base = `http://127.0.0.1:${port}`;
@@ -118,7 +133,7 @@ export async function verifySubmission(recipe: VerifyRecipe, poc: Poc): Promise<
     log.push(`assertion /${poc.assertion}/ -> ${assertionMatched ? "MATCH (impact proven)" : "no match"}`);
 
     const evidenceHash = "0x" + createHash("sha256").update(combined).digest("hex");
-    return { proven: assertionMatched, impact: poc.impact, assertionMatched, transcript, evidenceHash, log };
+    return { proven: assertionMatched, impact: poc.impact, assertionMatched, transcript, evidenceHash, log, surface, representative };
   } catch (e) {
     log.push("verify error: " + (e instanceof Error ? e.message : String(e)));
     return fail();
@@ -127,6 +142,6 @@ export async function verifySubmission(recipe: VerifyRecipe, poc: Poc): Promise<
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
   function fail(): VerifyResult {
-    return { proven: false, impact: poc.impact, assertionMatched: false, transcript, evidenceHash: "0x", log, error: "verification could not complete" };
+    return { proven: false, impact: poc.impact, assertionMatched: false, transcript, evidenceHash: "0x", log, error: "verification could not complete", surface, representative };
   }
 }

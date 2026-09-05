@@ -45,6 +45,119 @@ export async function list_impacts(ctx: CompanyContext) {
 }
 
 /**
+ * Assess the target's DEPLOYMENT before writing scope. Exploitability is a
+ * property of code × deployment: the same repo can carry a "real" CVE that is
+ * dead in production because the platform it runs on removes the exploited
+ * surface (the textbook case being Next.js middleware auth bypass on Vercel).
+ *
+ * Given the platform + framework, this returns (a) a deployment profile to
+ * commit alongside the verification recipe, and (b) suggested scopeOut lines for
+ * classes commonly neutralised on that platform. The company confirms them — the
+ * lines are proposals, hash-committed and shown to hunters once accepted, never
+ * an automatic rejection.
+ */
+export async function assess_deployment(
+  _ctx: CompanyContext,
+  args: { platform: string; framework?: string; frameworkVersion?: string; runtime?: string; waf?: boolean; notes?: string },
+) {
+  const { normalizePlatform, neutralizedFor, describeSurface, PLATFORMS } = await import("../lib/deployment-context");
+  const platform = normalizePlatform(args.platform);
+  const profile = {
+    platform,
+    framework: args.framework?.trim() || undefined,
+    frameworkVersion: args.frameworkVersion?.trim() || undefined,
+    runtime: args.runtime?.trim() || undefined,
+    waf: args.waf ?? undefined,
+    notes: args.notes?.trim() || undefined,
+  };
+  const hits = neutralizedFor(profile);
+  const surface = describeSurface(profile);
+  return {
+    deployment: profile,
+    platformLabel: PLATFORMS[platform].label,
+    verificationSurface: surface.surface,
+    representativeInSandbox: surface.representative,
+    suggestedScopeOut: hits.map((h) => h.scopeOutLine),
+    neutralized: hits.map(({ id, title, reference, reason }) => ({ id, title, reference, reason })),
+    note:
+      hits.length === 0
+        ? "No commonly-neutralised classes matched this platform. Write scope from the code as usual."
+        : "Review these with the company. Fold the ones they confirm into scopeOut (they become hash-committed and " +
+          "visible to hunters before they bond). Pass `deployment` into the verification recipe so verdicts name the " +
+          "surface they proved against." +
+          (surface.representative
+            ? ""
+            : " NOTE: the sandbox cannot reproduce this platform faithfully yet, so a 'proven' verdict here is labelled " +
+              "non-representative — the company confirms against production before paying."),
+  };
+}
+
+/**
+ * The web3 counterpart of assess_deployment: assess a SMART CONTRACT target
+ * before writing scope. Exploitability is code × VM — a class real on the EVM
+ * can be impossible on Move or Solana (reentrancy on Move, delegatecall/storage
+ * collision off-EVM, silent overflow on Solidity >=0.8 or Move).
+ *
+ * The target is ingested one of three ways: a deployed+verified contract
+ * (strongest — fork the chain, run the PoC against real state), a source repo
+ * (Foundry/Anchor/Move — build + fork), or an ABI/IDL only (black-box interface,
+ * weakest). Returns a web3 target profile to commit with the onchain-fork recipe,
+ * suggested scopeOut lines for classes not applicable on that VM, and the
+ * VM-specific classes the company should make sure it prices.
+ */
+export async function assess_web3(
+  _ctx: CompanyContext,
+  args: {
+    ecosystem?: string;            // evm | solana | aptos | sui | cosmwasm | polkadot
+    language: string;              // solidity | vyper | move | rust
+    sourceMode: "verified-onchain" | "abi-only" | "repo";
+    contracts?: { address?: string; name?: string; verified?: boolean; abiProvided?: boolean }[];
+    repo?: string;
+    network?: string;
+    forkBlock?: number;
+    solidityGte08?: boolean;       // Solidity target on >=0.8 (checked arithmetic by default)?
+    notes?: string;
+  },
+) {
+  const {
+    normalizeEcosystem, ecosystemFromLang, notApplicableFor, describeSource,
+    ECOSYSTEMS, VM_IN_SCOPE_HINTS,
+  } = await import("../lib/chain-context");
+  const language = (args.language?.trim().toLowerCase() || "solidity") as any;
+  const ecosystem = args.ecosystem ? normalizeEcosystem(args.ecosystem) : ecosystemFromLang(language);
+  const eco = ECOSYSTEMS[ecosystem];
+  const target = {
+    ecosystem,
+    language,
+    network: args.network?.trim() || undefined,
+    forkBlock: args.forkBlock,
+    sourceMode: args.sourceMode,
+    contracts: Array.isArray(args.contracts) ? args.contracts : [],
+    repo: args.repo?.trim() || undefined,
+    notes: args.notes?.trim() || undefined,
+  };
+  const na = notApplicableFor({ ecosystem, language, solidityGte08: args.solidityGte08 });
+  const source = describeSource(target);
+  return {
+    target,
+    ecosystemLabel: eco.label,
+    vm: eco.vm,
+    verificationApproach: source.approach,
+    sourceComplete: source.complete,
+    sourceNote: source.note,
+    suggestedScopeOut: na.map((h) => h.scopeOutLine),
+    notApplicable: na.map(({ id, title, reason }) => ({ id, title, reason })),
+    shouldPrice: VM_IN_SCOPE_HINTS[eco.vm],
+    note:
+      "Review with the company. Fold confirmed suggestedScopeOut lines into scopeOut (hash-committed, shown to " +
+      "hunters). Make sure the `shouldPrice` classes are covered by acceptedImpacts so scope isn't accidentally " +
+      "too narrow. Carry `target` into the onchain-fork verification recipe." +
+      (source.complete ? "" : " WARNING: ABI-only — a verdict can exercise the interface but cannot read logic; " +
+        "prefer a verified deployment or source repo before opening a high-value pool."),
+  };
+}
+
+/**
  * Build a payout table from a preset or a TVL, with optional per-severity
  * overrides. Returns the table plus whether it is monotonic — the human's
  * prices ride on top, the tool just checks the shape is payable.
@@ -166,6 +279,8 @@ export async function verify_bounty(ctx: CompanyContext) {
 export const COMPANY_TOOLS = {
   read_target,
   list_impacts,
+  assess_deployment,
+  assess_web3,
   propose_payouts,
   draft_bounty,
   provision_wallet,
